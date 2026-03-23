@@ -74,6 +74,7 @@ type ConfluenceConfig struct {
 	BaseURL            string              `yaml:"base_url"`
 	Username           string              `yaml:"username"`
 	APIKey             string              `yaml:"api_key"`
+	APIVersion         string              `yaml:"api_version"`           // API version: "v1" or "v2"
 	SpaceMappings      []SpaceMapping      `yaml:"space_mappings"`       // Per-space knowledge mappings
 	ParentPageMappings []ParentPageMapping `yaml:"parent_page_mappings"` // Per-parent-page knowledge mappings
 	PageLimit          int                 `yaml:"page_limit"`
@@ -158,6 +159,7 @@ func Load(path string) (*Config, error) {
 			BaseURL:            "",
 			Username:           "",
 			APIKey:             getEnv("CONFLUENCE_API_KEY", ""),
+			APIVersion:         "v2",
 			SpaceMappings:      []SpaceMapping{},
 			ParentPageMappings: []ParentPageMapping{},
 			PageLimit:          100,

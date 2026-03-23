@@ -33,6 +33,69 @@ type ConfluenceAdapter struct {
 	parentPageMappings map[string]string // parent_page_id -> knowledge_id mapping
 }
 
+// ConfluencePageV1 represents a page from Confluence API v1
+type ConfluencePageV1 struct {
+	ID          string                 `json:"id"`
+	Title       string                 `json:"title"`
+	Space       ConfluenceSpaceV1      `json:"space"`
+	Body        ConfluenceBodyV1       `json:"body"`
+	Version     ConfluenceVersionV1    `json:"version"`
+	History     ConfluenceHistoryV1    `json:"history"`
+	Links       map[string]interface{} `json:"_links"`
+}
+
+// ConfluenceSpaceV1 represents a space from Confluence API v1
+type ConfluenceSpaceV1 struct {
+	ID   string `json:"id"`
+	Key  string `json:"key"`
+	Name string `json:"name"`
+}
+
+// ConfluenceBodyV1 represents the body content for API v1
+type ConfluenceBodyV1 struct {
+	Storage ConfluenceBodyStorageV1 `json:"storage"`
+}
+
+// ConfluenceBodyStorageV1 represents the storage content for API v1
+type ConfluenceBodyStorageV1 struct {
+	Value          string `json:"value"`
+	Representation string `json:"representation"`
+}
+
+// ConfluenceVersionV1 represents version information for API v1
+type ConfluenceVersionV1 struct {
+	Number int `json:"number"`
+}
+
+// ConfluenceHistoryV1 represents history information for API v1
+type ConfluenceHistoryV1 struct {
+	CreatedBy ConfluenceUserV1 `json:"createdBy"`
+	CreatedAt string           `json:"createdAt"`
+}
+
+// ConfluenceUserV1 represents a user from Confluence API v1
+type ConfluenceUserV1 struct {
+	DisplayName string `json:"displayName"`
+}
+
+// ConfluencePageListV1 represents the response from listing pages in API v1
+type ConfluencePageListV1 struct {
+	Results []ConfluencePageV1     `json:"results"`
+	Links   map[string]interface{} `json:"_links"`
+}
+
+// ConfluenceChildPageListV1 represents the response from listing child pages in API v1
+type ConfluenceChildPageListV1 struct {
+	Results []ConfluencePageV1     `json:"results"`
+	Links   map[string]interface{} `json:"_links"`
+}
+
+// ConfluenceSpaceListV1 represents the response from listing spaces in API v1
+type ConfluenceSpaceListV1 struct {
+	Results []ConfluenceSpaceV1    `json:"results"`
+	Links   map[string]interface{} `json:"_links"`
+}
+
 // ConfluenceSpace represents a space from Confluence API
 type ConfluenceSpace struct {
 	ID                 string                 `json:"id"`
@@ -369,7 +432,16 @@ func (c *ConfluenceAdapter) FetchFiles(ctx context.Context) ([]*File, error) {
 func (c *ConfluenceAdapter) getSpaceID(ctx context.Context, spaceKey string) (string, error) {
 	// URL encode the space key
 	encodedSpaceKey := url.QueryEscape(spaceKey)
-	url := fmt.Sprintf("%s/wiki/api/v2/spaces?keys=%s", c.config.BaseURL, encodedSpaceKey)
+	var url string
+	var spaceID string
+
+	if c.config.APIVersion == "v1" {
+		// API v1 endpoint
+		url = fmt.Sprintf("%s/wiki/rest/api/space/%s", c.config.BaseURL, encodedSpaceKey)
+	} else {
+		// API v2 endpoint (default)
+		url = fmt.Sprintf("%s/wiki/api/v2/spaces?keys=%s", c.config.BaseURL, encodedSpaceKey)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -398,20 +470,40 @@ func (c *ConfluenceAdapter) getSpaceID(ctx context.Context, spaceKey string) (st
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var spaceList ConfluenceSpaceList
-	if err := json.NewDecoder(resp.Body).Decode(&spaceList); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
+	if c.config.APIVersion == "v1" {
+		// API v1 response parsing
+		var space ConfluenceSpaceV1
+		if err := json.NewDecoder(resp.Body).Decode(&space); err != nil {
+			return "", fmt.Errorf("failed to decode response: %w", err)
+		}
+		spaceID = space.ID
+	} else {
+		// API v2 response parsing
+		var spaceList ConfluenceSpaceList
+		if err := json.NewDecoder(resp.Body).Decode(&spaceList); err != nil {
+			return "", fmt.Errorf("failed to decode response: %w", err)
+		}
+
+		if len(spaceList.Results) == 0 {
+			return "", fmt.Errorf("space %s not found", spaceKey)
+		}
+
+		spaceID = spaceList.Results[0].ID
 	}
 
-	if len(spaceList.Results) == 0 {
-		return "", fmt.Errorf("space %s not found", spaceKey)
-	}
-
-	return spaceList.Results[0].ID, nil
+	return spaceID, nil
 }
 
 // fetchSpacePages fetches all pages from a space using space ID
 func (c *ConfluenceAdapter) fetchSpacePages(ctx context.Context, spaceID string) ([]ConfluencePage, error) {
+	if c.config.APIVersion == "v1" {
+		return c.fetchSpacePagesV1(ctx, spaceID)
+	}
+	return c.fetchSpacePagesV2(ctx, spaceID)
+}
+
+// fetchSpacePagesV2 fetches all pages from a space using space ID with API v2
+func (c *ConfluenceAdapter) fetchSpacePagesV2(ctx context.Context, spaceID string) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
 	limit := c.config.PageLimit
 	if limit <= 0 {
@@ -468,7 +560,6 @@ func (c *ConfluenceAdapter) fetchSpacePages(ctx context.Context, spaceID string)
 		}
 
 		url = nextURL
-		url = nextURL
 	}
 
 	// Extract all unique AuthorIDs from pages
@@ -505,8 +596,100 @@ func (c *ConfluenceAdapter) fetchSpacePages(ctx context.Context, spaceID string)
 	return allPages, nil
 }
 
+// fetchSpacePagesV1 fetches all pages from a space using space ID with API v1
+func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceID string) ([]ConfluencePage, error) {
+	var allPages []ConfluencePage
+	limit := c.config.PageLimit
+	if limit <= 0 {
+		limit = 100 // Default limit
+	}
+
+	url := fmt.Sprintf("%s/wiki/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, spaceID, limit)
+
+	for {
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		// Set authentication
+		req.SetBasicAuth(c.config.Username, c.config.APIKey)
+		req.Header.Set("Accept", "application/json")
+
+		logrus.Debugf("Confluence pages API v1 URL: %s", url)
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to make request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("API request failed with status %d: response body omitted", resp.StatusCode)
+		}
+
+		var pageList ConfluencePageListV1
+		if err := json.NewDecoder(resp.Body).Decode(&pageList); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+		resp.Body.Close()
+
+		// Convert v1 pages to v2 format
+		for _, v1Page := range pageList.Results {
+			page := ConfluencePage{
+				ID:                v1Page.ID,
+				Status:            "current",
+				Title:             v1Page.Title,
+				SpaceID:           v1Page.Space.ID,
+				AuthorID:          "", // API v1 doesn't provide account ID
+				AuthorDisplayName: v1Page.History.CreatedBy.DisplayName,
+				CreatedAt:         v1Page.History.CreatedAt,
+				Version: ConfluenceVersion{
+					Number: v1Page.Version.Number,
+				},
+				Body: ConfluenceBody{
+					View: ConfluenceBodyView{
+						Value: v1Page.Body.Storage.Value,
+					},
+				},
+				Links: v1Page.Links,
+			}
+			allPages = append(allPages, page)
+		}
+
+		// Check for next page
+		nextLink, hasNext := pageList.Links["next"]
+		if !hasNext {
+			break
+		}
+
+		nextURL, ok := nextLink.(string)
+		if !ok {
+			break
+		}
+		// Check if nextURL doesn't start with https
+		if nextURL != "" && !strings.HasPrefix(nextURL, "https") {
+			// Prepend the base URL
+			nextURL = c.config.BaseURL + nextURL
+		}
+
+		url = nextURL
+	}
+
+	return allPages, nil
+}
+
 // fetchPageByID fetches a specific page by its ID
 func (c *ConfluenceAdapter) fetchPageByID(ctx context.Context, pageID string) (ConfluencePage, error) {
+	if c.config.APIVersion == "v1" {
+		return c.fetchPageByIDV1(ctx, pageID)
+	}
+	return c.fetchPageByIDV2(ctx, pageID)
+}
+
+// fetchPageByIDV2 fetches a specific page by its ID using API v2
+func (c *ConfluenceAdapter) fetchPageByIDV2(ctx context.Context, pageID string) (ConfluencePage, error) {
 	url := fmt.Sprintf("%s/wiki/api/v2/pages/%s", c.config.BaseURL, pageID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -539,8 +722,70 @@ func (c *ConfluenceAdapter) fetchPageByID(ctx context.Context, pageID string) (C
 	return page, nil
 }
 
+// fetchPageByIDV1 fetches a specific page by its ID using API v1
+func (c *ConfluenceAdapter) fetchPageByIDV1(ctx context.Context, pageID string) (ConfluencePage, error) {
+	url := fmt.Sprintf("%s/wiki/rest/api/content/%s?expand=body.storage,history.createdBy,space", c.config.BaseURL, pageID)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return ConfluencePage{}, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set authentication
+	req.SetBasicAuth(c.config.Username, c.config.APIKey)
+	req.Header.Set("Accept", "application/json")
+
+	logrus.Debugf("Confluence page API v1 URL: %s", url)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return ConfluencePage{}, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body) // Consume body for proper connection reuse
+		logrus.Errorf("Confluence page API v1 failed - Status: %d, URL: %s, Response: %s", resp.StatusCode, url, string(body))
+		return ConfluencePage{}, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var v1Page ConfluencePageV1
+	if err := json.NewDecoder(resp.Body).Decode(&v1Page); err != nil {
+		return ConfluencePage{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Convert v1 page to v2 format
+	page := ConfluencePage{
+		ID:                v1Page.ID,
+		Status:            "current",
+		Title:             v1Page.Title,
+		SpaceID:           v1Page.Space.ID,
+		AuthorID:          "", // API v1 doesn't provide account ID
+		AuthorDisplayName: v1Page.History.CreatedBy.DisplayName,
+		CreatedAt:         v1Page.History.CreatedAt,
+		Version: ConfluenceVersion{
+			Number: v1Page.Version.Number,
+		},
+		Body: ConfluenceBody{
+			View: ConfluenceBodyView{
+				Value: v1Page.Body.Storage.Value,
+			},
+		},
+		Links: v1Page.Links,
+	}
+
+	return page, nil
+}
+
 // fetchSubPages fetches all sub-pages under a specific parent page
 func (c *ConfluenceAdapter) fetchSubPages(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
+	if c.config.APIVersion == "v1" {
+		return c.fetchSubPagesV1(ctx, parentPageID)
+	}
+	return c.fetchSubPagesV2(ctx, parentPageID)
+}
+
+// fetchSubPagesV2 fetches all sub-pages under a specific parent page using API v2
+func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
 	limit := c.config.PageLimit
 	if limit <= 0 {
@@ -586,6 +831,89 @@ func (c *ConfluenceAdapter) fetchSubPages(ctx context.Context, parentPageID stri
 				continue
 			}
 			allPages = append(allPages, fullPage)
+		}
+
+		// Check for next page
+		nextLink, hasNext := childPageList.Links["next"]
+		if !hasNext {
+			break
+		}
+
+		nextURL, ok := nextLink.(string)
+		if !ok {
+			break
+		}
+		if nextURL != "" && !strings.HasPrefix(nextURL, "https") {
+			// Prepend the base URL
+			nextURL = c.config.BaseURL + nextURL
+		}
+		url = nextURL
+	}
+
+	return allPages, nil
+}
+
+// fetchSubPagesV1 fetches all sub-pages under a specific parent page using API v1
+func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
+	var allPages []ConfluencePage
+	limit := c.config.PageLimit
+	if limit <= 0 {
+		limit = 100 // Default limit
+	}
+
+	url := fmt.Sprintf("%s/wiki/rest/api/content/%s/child/page?limit=%d", c.config.BaseURL, parentPageID, limit)
+
+	for {
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		// Set authentication
+		req.SetBasicAuth(c.config.Username, c.config.APIKey)
+		req.Header.Set("Accept", "application/json")
+
+		logrus.Debugf("Confluence sub-pages API v1 URL: %s", url)
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to make request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("API request failed with status %d: response body omitted", resp.StatusCode)
+		}
+
+		var childPageList ConfluenceChildPageListV1
+		if err := json.NewDecoder(resp.Body).Decode(&childPageList); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+		resp.Body.Close()
+
+		// Convert v1 child pages to full pages
+		for _, childPage := range childPageList.Results {
+			// childPage already contains full page data in v1
+			page := ConfluencePage{
+				ID:                childPage.ID,
+				Status:            "current",
+				Title:             childPage.Title,
+				SpaceID:           childPage.Space.ID,
+				AuthorID:          "", // API v1 doesn't provide account ID
+				AuthorDisplayName: childPage.History.CreatedBy.DisplayName,
+				CreatedAt:         childPage.History.CreatedAt,
+				Version: ConfluenceVersion{
+					Number: childPage.Version.Number,
+				},
+				Body: ConfluenceBody{
+					View: ConfluenceBodyView{
+						Value: childPage.Body.Storage.Value,
+					},
+				},
+				Links: childPage.Links,
+			}
+			allPages = append(allPages, page)
 		}
 
 		// Check for next page
@@ -654,6 +982,14 @@ func (c *ConfluenceAdapter) processPage(ctx context.Context, page ConfluencePage
 
 // fetchPageBody fetches the body content of a specific page
 func (c *ConfluenceAdapter) fetchPageBody(ctx context.Context, pageID string) (string, error) {
+	if c.config.APIVersion == "v1" {
+		return c.fetchPageBodyV1(ctx, pageID)
+	}
+	return c.fetchPageBodyV2(ctx, pageID)
+}
+
+// fetchPageBodyV2 fetches the body content of a specific page using API v2
+func (c *ConfluenceAdapter) fetchPageBodyV2(ctx context.Context, pageID string) (string, error) {
 	url := fmt.Sprintf("%s/wiki/api/v2/pages/%s?body-format=export_view", c.config.BaseURL, pageID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -688,6 +1024,47 @@ func (c *ConfluenceAdapter) fetchPageBody(ctx context.Context, pageID string) (s
 			return c.HtmlToMarkdown(page.Body.ExportView.Value), nil
 		}
 		return c.HtmlToText(page.Body.ExportView.Value), nil
+	}
+
+	return "", fmt.Errorf("no content found in page body")
+}
+
+// fetchPageBodyV1 fetches the body content of a specific page using API v1
+func (c *ConfluenceAdapter) fetchPageBodyV1(ctx context.Context, pageID string) (string, error) {
+	url := fmt.Sprintf("%s/wiki/rest/api/content/%s?expand=body.storage", c.config.BaseURL, pageID)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set authentication
+	req.SetBasicAuth(c.config.Username, c.config.APIKey)
+	req.Header.Set("Accept", "application/json")
+
+	logrus.Debugf("Confluence page body API v1 URL: %s", url)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API request failed with status %d: response body omitted", resp.StatusCode)
+	}
+
+	var page ConfluencePageV1
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+	// Extract content from body.storage.value
+	if page.Body.Storage.Value != "" {
+		// Convert HTML to plain text or markdown based on configuration
+		if c.config.UseMarkdownParser {
+			return c.HtmlToMarkdown(page.Body.Storage.Value), nil
+		}
+		return c.HtmlToText(page.Body.Storage.Value), nil
 	}
 
 	return "", fmt.Errorf("no content found in page body")
@@ -909,15 +1286,62 @@ func (c *ConfluenceAdapter) fetchBlogpostBody(ctx context.Context, blogpostID st
 
 // HtmlToMarkdown converts HTML content to markdown
 func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
+	// Store reference to ConfluenceAdapter for use in plugin
+	adapter := c
+	
+	// Custom image processor plugin
+	imagePlugin := converter.PluginFunc(func(c *converter.Converter, root *html.Node) {
+		var processImage func(*html.Node)
+		processImage = func(n *html.Node) {
+			if n.Type == html.ElementNode && n.Data == "img" {
+				// Get image src and alt attributes
+				src := ""
+				alt := ""
+				for _, attr := range n.Attr {
+					if attr.Key == "src" {
+						src = attr.Val
+					} else if attr.Key == "alt" {
+						alt = attr.Val
+					}
+				}
+				
+				// Create markdown image syntax
+				if src != "" {
+					// Check if src is a relative URL
+					if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+						// Prepend base URL if relative
+						src = adapter.config.BaseURL + src
+					}
+					
+					// Replace the img node with text node containing markdown image
+					imgMarkdown := fmt.Sprintf("![%s](%s)", alt, src)
+					n.Type = html.TextNode
+					n.Data = imgMarkdown
+					n.Attr = nil
+					// Remove all children
+					for n.FirstChild != nil {
+						n.RemoveChild(n.FirstChild)
+					}
+				}
+			}
+			
+			// Process child nodes
+			for child := n.FirstChild; child != nil; child = child.NextSibling {
+				processImage(child)
+			}
+		}
+		
+		processImage(root)
+	})
+	
 	conv := converter.NewConverter(
 		converter.WithPlugins(
 			base.NewBasePlugin(),
 			commonmark.NewCommonmarkPlugin(
 				commonmark.WithStrongDelimiter("__"),
-				// ...additional configurations for the plugin
 			),
 			table.NewTablePlugin(),
-			// ...additional plugins (e.g. table)
+			imagePlugin,
 		),
 	)
 	markdown, err := conv.ConvertString(htmlContent)
