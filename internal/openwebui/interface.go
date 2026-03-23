@@ -13,4 +13,5 @@ type ClientInterface interface {
 	RemoveFileFromKnowledge(ctx context.Context, knowledgeID, fileID string) error
 	GetKnowledgeFiles(ctx context.Context, knowledgeID string) ([]*File, error)
 	DeleteFile(ctx context.Context, fileID string) error
+	GetFileProcessingStatus(ctx context.Context, fileID string) (status string, err error)
 }

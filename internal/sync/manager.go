@@ -371,7 +371,44 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 		logrus.Debugf("Adding file %s to knowledge %s", uploadedFile.ID, knowledgeID)
 		if err := m.openwebuiClient.AddFileToKnowledge(ctx, knowledgeID, uploadedFile.ID); err != nil {
 			logrus.Errorf("Failed to add file to knowledge: %v", err)
-			return fmt.Errorf("failed to add file to knowledge: %w", err)
+			
+			// Check if we have fallback content (markdown) to use instead of PDF
+			if len(file.FallbackContent) > 0 && file.FallbackPath != "" {
+				logrus.Infof("Attempting to use markdown fallback for %s", file.Path)
+				
+				// Delete the failed PDF file
+				if delErr := m.openwebuiClient.DeleteFile(ctx, uploadedFile.ID); delErr != nil {
+					logrus.Warnf("Failed to delete failed PDF file: %v", delErr)
+				}
+				
+				// Upload markdown fallback
+				fallbackUploaded, uploadErr := m.openwebuiClient.UploadFile(ctx, filepath.Base(file.FallbackPath), file.FallbackContent)
+				if uploadErr != nil {
+					return fmt.Errorf("failed to upload markdown fallback: %w", uploadErr)
+				}
+				
+				logrus.Debugf("Uploaded markdown fallback: ID=%s", fallbackUploaded.ID)
+				
+				// Add fallback to knowledge
+				if addErr := m.openwebuiClient.AddFileToKnowledge(ctx, knowledgeID, fallbackUploaded.ID); addErr != nil {
+					// Clean up the fallback file if adding fails
+					m.openwebuiClient.DeleteFile(ctx, fallbackUploaded.ID)
+					return fmt.Errorf("failed to add markdown fallback to knowledge: %w", addErr)
+				}
+				
+				// Update file info for index
+				uploadedFile = fallbackUploaded
+				file.Path = file.FallbackPath
+				file.Content = file.FallbackContent
+				hash := sha256.Sum256(file.FallbackContent)
+				file.Hash = fmt.Sprintf("%x", hash[:])
+				
+				logrus.Infof("Successfully used markdown fallback for %s", file.Path)
+			} else {
+				// Clean up the uploaded file if we can't add it to knowledge
+				m.openwebuiClient.DeleteFile(ctx, uploadedFile.ID)
+				return fmt.Errorf("failed to add file to knowledge: %w", err)
+			}
 		}
 		logrus.Debugf("File successfully added to knowledge")
 	} else {

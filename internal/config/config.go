@@ -70,18 +70,20 @@ type GitHubConfig struct {
 
 // ConfluenceConfig defines Confluence adapter settings
 type ConfluenceConfig struct {
-	Enabled            bool                `yaml:"enabled"`
-	BaseURL            string              `yaml:"base_url"`
-	Username           string              `yaml:"username"`
-	APIKey             string              `yaml:"api_key"`
-	APIVersion         string              `yaml:"api_version"`           // API version: "v1" or "v2"
-	SpaceMappings      []SpaceMapping      `yaml:"space_mappings"`       // Per-space knowledge mappings
-	ParentPageMappings []ParentPageMapping `yaml:"parent_page_mappings"` // Per-parent-page knowledge mappings
-	PageLimit          int                 `yaml:"page_limit"`
-	IncludeAttachments bool                `yaml:"include_attachments"`
-	UseMarkdownParser  bool                `yaml:"use_markdown_parser"`
-	IncludeBlogPosts   bool                `yaml:"include_blog_posts"`
-	AddAdditionalData  bool                `yaml:"add_additional_data"`
+	Enabled             bool                `yaml:"enabled"`
+	BaseURL             string              `yaml:"base_url"`
+	Username            string              `yaml:"username"`
+	APIKey              string              `yaml:"api_key"`
+	PersonalAccessToken string              `yaml:"personal_access_token"` // PAT for attachment downloads
+	APIVersion          string              `yaml:"api_version"`           // API version: "v1" or "v2"
+	SpaceMappings       []SpaceMapping      `yaml:"space_mappings"`        // Per-space knowledge mappings
+	ParentPageMappings  []ParentPageMapping `yaml:"parent_page_mappings"`  // Per-parent-page knowledge mappings
+	PageLimit           int                 `yaml:"page_limit"`
+	IncludeAttachments  bool                `yaml:"include_attachments"`
+	UseMarkdownParser   bool                `yaml:"use_markdown_parser"`
+	IncludeBlogPosts    bool                `yaml:"include_blog_posts"`
+	AddAdditionalData   bool                `yaml:"add_additional_data"`
+	ExportAsPDF         bool                `yaml:"export_as_pdf"` // Export pages as PDF instead of markdown
 }
 
 // LocalFolderConfig defines local folder adapter settings
@@ -222,6 +224,7 @@ func Load(path string) (*Config, error) {
 	cfg.OpenWebUI.APIKey = getEnv("OPENWEBUI_API_KEY", cfg.OpenWebUI.APIKey)
 	cfg.GitHub.Token = getEnv("GITHUB_TOKEN", cfg.GitHub.Token)
 	cfg.Confluence.APIKey = getEnv("CONFLUENCE_API_KEY", cfg.Confluence.APIKey)
+	cfg.Confluence.PersonalAccessToken = getEnv("CONFLUENCE_PAT", cfg.Confluence.PersonalAccessToken)
 	cfg.Jira.APIKey = getEnv("CONFLUENCE_API_KEY", cfg.Jira.APIKey)
 	cfg.Storage.Path = getEnv("STORAGE_PATH", cfg.Storage.Path)
 

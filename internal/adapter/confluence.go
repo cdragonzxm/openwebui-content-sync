@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strings"
@@ -31,6 +32,8 @@ type ConfluenceAdapter struct {
 	parentPageIDs      []string
 	spaceMappings      map[string]string // space_key -> knowledge_id mapping
 	parentPageMappings map[string]string // parent_page_id -> knowledge_id mapping
+	currentPageID      string            // current page ID for attachment downloads
+	cookieJar          http.CookieJar    // shared cookie jar for session authentication
 }
 
 // ConfluencePageV1 represents a page from Confluence API v1
@@ -299,8 +302,26 @@ func NewConfluenceAdapter(cfg config.ConfluenceConfig) (*ConfluenceAdapter, erro
 		return nil, fmt.Errorf("at least one confluence space or parent page mapping must be configured")
 	}
 
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cookie jar: %w", err)
+	}
+
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 60 * time.Second,
+		Jar:     jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			for key, values := range via[0].Header {
+				if key != "Authorization" && key != "Cookie" {
+					req.Header[key] = values
+				}
+			}
+			logrus.Debugf("Following redirect from %s to %s", via[len(via)-1].URL.String(), req.URL.String())
+			return nil
+		},
 	}
 
 	return &ConfluenceAdapter{
@@ -311,7 +332,74 @@ func NewConfluenceAdapter(cfg config.ConfluenceConfig) (*ConfluenceAdapter, erro
 		spaceMappings:      spaceMappings,
 		parentPageMappings: parentPageMappings,
 		lastSync:           time.Now(),
+		cookieJar:          jar,
 	}, nil
+}
+
+// loginAndGetSessionCookies logs into Confluence and returns session cookies
+func (c *ConfluenceAdapter) loginAndGetSessionCookies() error {
+	logrus.Debugf("Attempting to login to Confluence to get session cookies")
+
+	loginClient := &http.Client{
+		Timeout: 30 * time.Second,
+		Jar:     c.cookieJar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	loginURL := c.config.BaseURL + "/login.action"
+	req, err := http.NewRequestWithContext(context.Background(), "GET", loginURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create login page request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := loginClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get login page: %w", err)
+	}
+	resp.Body.Close()
+	logrus.Debugf("Got login page, status: %d", resp.StatusCode)
+
+	doLoginURL := c.config.BaseURL + "/dologin.action"
+	formData := url.Values{}
+	formData.Set("os_username", c.config.Username)
+	formData.Set("os_password", c.config.APIKey)
+	formData.Set("login", "Log In")
+	formData.Set("os_destination", "")
+	formData.Set("os_cookie", "true")
+
+	loginReq, err := http.NewRequestWithContext(context.Background(), "POST", doLoginURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return fmt.Errorf("failed to create login request: %w", err)
+	}
+
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	loginReq.Header.Set("Origin", c.config.BaseURL)
+	loginReq.Header.Set("Referer", loginURL)
+
+	loginResp, err := loginClient.Do(loginReq)
+	if err != nil {
+		return fmt.Errorf("login request failed: %w", err)
+	}
+	defer loginResp.Body.Close()
+
+	logrus.Debugf("Login response status: %d", loginResp.StatusCode)
+
+	u, _ := url.Parse(c.config.BaseURL)
+	allCookies := c.cookieJar.Cookies(u)
+	if len(allCookies) == 0 {
+		return fmt.Errorf("no session cookies received from login")
+	}
+
+	var cookieNames []string
+	for _, cookie := range allCookies {
+		cookieNames = append(cookieNames, cookie.Name)
+	}
+	logrus.Infof("Login successful, got %d cookies for session authentication: %v", len(allCookies), cookieNames)
+	return nil
 }
 
 // Name returns the adapter name
@@ -784,8 +872,13 @@ func (c *ConfluenceAdapter) fetchSubPages(ctx context.Context, parentPageID stri
 	return c.fetchSubPagesV2(ctx, parentPageID)
 }
 
-// fetchSubPagesV2 fetches all sub-pages under a specific parent page using API v2
+// fetchSubPagesV2 fetches all sub-pages under a specific parent page using API v2 (recursively)
 func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
+	return c.fetchSubPagesV2Recursive(ctx, parentPageID)
+}
+
+// fetchSubPagesV2Recursive recursively fetches all sub-pages under a parent page using API v2
+func (c *ConfluenceAdapter) fetchSubPagesV2Recursive(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
 	limit := c.config.PageLimit
 	if limit <= 0 {
@@ -800,7 +893,6 @@ func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID st
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 
-		// Set authentication
 		req.SetBasicAuth(c.config.Username, c.config.APIKey)
 		req.Header.Set("Accept", "application/json")
 
@@ -823,7 +915,6 @@ func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID st
 		}
 		resp.Body.Close()
 
-		// Convert child pages to full pages by fetching each one
 		for _, childPage := range childPageList.Results {
 			fullPage, err := c.fetchPageByID(ctx, childPage.ID)
 			if err != nil {
@@ -831,9 +922,15 @@ func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID st
 				continue
 			}
 			allPages = append(allPages, fullPage)
+
+			subPages, err := c.fetchSubPagesV2Recursive(ctx, childPage.ID)
+			if err != nil {
+				logrus.Warnf("Failed to fetch sub-pages for %s: %v", childPage.ID, err)
+			} else {
+				allPages = append(allPages, subPages...)
+			}
 		}
 
-		// Check for next page
 		nextLink, hasNext := childPageList.Links["next"]
 		if !hasNext {
 			break
@@ -844,7 +941,6 @@ func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID st
 			break
 		}
 		if nextURL != "" && !strings.HasPrefix(nextURL, "https") {
-			// Prepend the base URL
 			nextURL = c.config.BaseURL + nextURL
 		}
 		url = nextURL
@@ -853,8 +949,13 @@ func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID st
 	return allPages, nil
 }
 
-// fetchSubPagesV1 fetches all sub-pages under a specific parent page using API v1
+// fetchSubPagesV1 fetches all sub-pages under a specific parent page using API v1 (recursively)
 func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
+	return c.fetchSubPagesV1Recursive(ctx, parentPageID)
+}
+
+// fetchSubPagesV1Recursive recursively fetches all sub-pages under a parent page
+func (c *ConfluenceAdapter) fetchSubPagesV1Recursive(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
 	limit := c.config.PageLimit
 	if limit <= 0 {
@@ -869,7 +970,6 @@ func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID st
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 
-		// Set authentication
 		req.SetBasicAuth(c.config.Username, c.config.APIKey)
 		req.Header.Set("Accept", "application/json")
 
@@ -892,15 +992,13 @@ func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID st
 		}
 		resp.Body.Close()
 
-		// Convert v1 child pages to full pages
 		for _, childPage := range childPageList.Results {
-			// childPage already contains full page data in v1
 			page := ConfluencePage{
 				ID:                childPage.ID,
 				Status:            "current",
 				Title:             childPage.Title,
 				SpaceID:           childPage.Space.ID.String(),
-				AuthorID:          "", // API v1 doesn't provide account ID
+				AuthorID:          "",
 				AuthorDisplayName: childPage.History.CreatedBy.DisplayName,
 				CreatedAt:         childPage.History.CreatedAt,
 				Version: ConfluenceVersion{
@@ -914,9 +1012,15 @@ func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID st
 				Links: childPage.Links,
 			}
 			allPages = append(allPages, page)
+
+			subPages, err := c.fetchSubPagesV1Recursive(ctx, childPage.ID)
+			if err != nil {
+				logrus.Warnf("Failed to fetch sub-pages for %s: %v", childPage.ID, err)
+			} else {
+				allPages = append(allPages, subPages...)
+			}
 		}
 
-		// Check for next page
 		nextLink, hasNext := childPageList.Links["next"]
 		if !hasNext {
 			break
@@ -927,7 +1031,6 @@ func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID st
 			break
 		}
 		if nextURL != "" && !strings.HasPrefix(nextURL, "https") {
-			// Prepend the base URL
 			nextURL = c.config.BaseURL + nextURL
 		}
 		url = nextURL
@@ -938,48 +1041,118 @@ func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID st
 
 // processPage processes a single page and returns a File
 func (c *ConfluenceAdapter) processPage(ctx context.Context, page ConfluencePage, knowledgeID string) (*File, error) {
-	// Get the page body with content
-	pageBody, err := c.fetchPageBody(ctx, page.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch page body: %w", err)
+	c.currentPageID = page.ID
+
+	var fileContent []byte
+	var filename string
+	var fallbackContent []byte
+	var fallbackFilename string
+
+	generateMarkdownContent := func() ([]byte, string, error) {
+		pageBody, err := c.fetchPageBody(ctx, page.ID)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to fetch page body: %w", err)
+		}
+		mdFilename := c.generateUniqueFilename(page.Title, page.ID, c.config.UseMarkdownParser)
+		webuiLink := ""
+		if webui, exists := page.Links["webui"]; exists {
+			if webuiStr, ok := webui.(string); ok {
+				webuiLink = webuiStr
+			}
+		}
+		metaData := fmt.Sprintf("---\nAuthor: %s\nCreatedAt: %s\nLinkToPage: %s\nTitle: %s\nPageID: %s\n---", page.AuthorDisplayName, page.CreatedAt, c.config.BaseURL+"/wiki"+webuiLink, page.Title, page.ID)
+		content := fmt.Sprintf("%s\n\n%s", metaData, pageBody)
+		return []byte(content), mdFilename, nil
 	}
 
-	// Create filename from title
-	filename := c.SanitizeFilename(page.Title)
-	if c.config.UseMarkdownParser {
-		filename += ".md"
+	if c.config.ExportAsPDF {
+		pdfData, err := c.exportPageAsPDF(ctx, page.ID)
+		if err != nil {
+			logrus.Warnf("Failed to export page %s as PDF, falling back to markdown: %v", page.Title, err)
+			fileContent, filename, err = generateMarkdownContent()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			filename = c.SanitizeFilename(page.Title) + "_" + page.ID + ".pdf"
+			fileContent = pdfData
+			var fbErr error
+			fallbackContent, fallbackFilename, fbErr = generateMarkdownContent()
+			if fbErr != nil {
+				logrus.Warnf("Failed to generate markdown fallback for page %s: %v", page.Title, fbErr)
+			}
+		}
 	} else {
-		filename += ".txt"
-	}
-
-	// Format content as webui link + body content
-	webuiLink := ""
-	if webui, exists := page.Links["webui"]; exists {
-		if webuiStr, ok := webui.(string); ok {
-			webuiLink = webuiStr
+		var mdErr error
+		fileContent, filename, mdErr = generateMarkdownContent()
+		if mdErr != nil {
+			return nil, mdErr
 		}
 	}
-	metaData := fmt.Sprintf("---\nAuthor: %s\nCreatedAt: %s\nLinkToPage: %s\nTitle: %s\n---", page.AuthorDisplayName, page.CreatedAt, c.config.BaseURL+"/wiki"+webuiLink, page.Title)
-	content := fmt.Sprintf("%s\n\n%s", metaData, pageBody)
 
-	// Create file content
-	fileContent := []byte(content)
-
-	// Generate content hash for change detection
 	hash := sha256.Sum256(fileContent)
 	contentHash := base64.StdEncoding.EncodeToString(hash[:])
 
-	logrus.Debugf("Generated file content for %s: %d bytes, first 200 chars: %q", filename, len(fileContent), string(fileContent[:min(200, len(fileContent))]))
+	logrus.Debugf("Generated file content for %s: %d bytes", filename, len(fileContent))
 
 	return &File{
-		Path:        filename,
-		Content:     fileContent,
-		Hash:        contentHash,
-		Modified:    c.lastSync,
-		Size:        int64(len(fileContent)),
-		Source:      "confluence",
-		KnowledgeID: knowledgeID,
+		Path:            filename,
+		Content:         fileContent,
+		Hash:            contentHash,
+		Modified:        c.lastSync,
+		Size:            int64(len(fileContent)),
+		Source:          "confluence",
+		KnowledgeID:     knowledgeID,
+		FallbackPath:    fallbackFilename,
+		FallbackContent: fallbackContent,
 	}, nil
+}
+
+// exportPageAsPDF exports a Confluence page as PDF
+func (c *ConfluenceAdapter) exportPageAsPDF(ctx context.Context, pageID string) ([]byte, error) {
+	u, _ := url.Parse(c.config.BaseURL)
+	cookies := c.cookieJar.Cookies(u)
+	if len(cookies) == 0 {
+		if err := c.loginAndGetSessionCookies(); err != nil {
+			return nil, fmt.Errorf("failed to login for PDF export: %w", err)
+		}
+	}
+
+	pdfURL := fmt.Sprintf("%s/spaces/flyingpdf/pdfpageexport.action?pageId=%s", c.config.BaseURL, pageID)
+	logrus.Debugf("Exporting page as PDF: %s", pdfURL)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", pdfURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create PDF export request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/pdf,*/*")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("PDF export request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	logrus.Debugf("PDF export response status: %d, Content-Type: %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("PDF export failed with status %d", resp.StatusCode)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if strings.Contains(contentType, "text/html") {
+		return nil, fmt.Errorf("PDF export returned HTML (likely auth redirect)")
+	}
+
+	pdfData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read PDF data: %w", err)
+	}
+
+	logrus.Infof("Successfully exported page %s as PDF (%d bytes)", pageID, len(pdfData))
+	return pdfData, nil
 }
 
 // fetchPageBody fetches the body content of a specific page
@@ -1202,35 +1375,27 @@ func (c *ConfluenceAdapter) fetchBlogpostByID(ctx context.Context, blogpostID st
 
 // processBlogpost processes a single blog post and returns a File
 func (c *ConfluenceAdapter) processBlogpost(ctx context.Context, blogpost ConfluenceBlogPost, knowledgeID string) (*File, error) {
-	// Get the blog post body with content
+	c.currentPageID = blogpost.ID
+
 	blogpostBody, err := c.fetchBlogpostBody(ctx, blogpost.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch blogpost body: %w", err)
 	}
 
-	// Create filename from title
-	filename := c.SanitizeFilename(blogpost.Title)
-	if c.config.UseMarkdownParser {
-		filename += ".md"
-	} else {
-		filename += ".txt"
-	}
+	filename := c.generateUniqueFilename(blogpost.Title, blogpost.ID, c.config.UseMarkdownParser)
 
-	// Format content as webui link + body content
 	webuiLink := ""
 	if webui, exists := blogpost.Links["webui"]; exists {
 		if webuiStr, ok := webui.(string); ok {
 			webuiLink = webuiStr
 		}
 	}
-	metaData := fmt.Sprintf("Author: %s\nCreatedAt: %s\nLinkToPage: %s", blogpost.AuthorDisplayName, blogpost.CreatedAt, c.config.BaseURL+"/wiki"+webuiLink)
+	metaData := fmt.Sprintf("---\nAuthor: %s\nCreatedAt: %s\nLinkToPage: %s\nTitle: %s\nBlogpostID: %s\n---", blogpost.AuthorDisplayName, blogpost.CreatedAt, c.config.BaseURL+"/wiki"+webuiLink, blogpost.Title, blogpost.ID)
 
 	content := fmt.Sprintf("%s\n\n%s", metaData, blogpostBody)
 
-	// Create file content
 	fileContent := []byte(content)
 
-	// Generate content hash for change detection
 	hash := sha256.Sum256(fileContent)
 	contentHash := base64.StdEncoding.EncodeToString(hash[:])
 
@@ -1286,9 +1451,10 @@ func (c *ConfluenceAdapter) fetchBlogpostBody(ctx context.Context, blogpostID st
 	return "", fmt.Errorf("no content found in blogpost body")
 }
 
-// HtmlToMarkdown converts HTML content to markdown
+// HtmlToMarkdown converts HTML content to markdown with embedded images
 func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
-	// Create a custom converter with image handling
+	htmlContent = c.preprocessConfluenceImages(htmlContent)
+
 	conv := converter.NewConverter(
 		converter.WithPlugins(
 			base.NewBasePlugin(),
@@ -1299,9 +1465,7 @@ func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
 		),
 	)
 
-	// Register custom image renderer
 	conv.Register.RendererFor("img", converter.TagTypeInline, func(ctx converter.Context, w converter.Writer, node *html.Node) converter.RenderStatus {
-		// Get image src and alt attributes
 		src := ""
 		alt := ""
 		for _, attr := range node.Attr {
@@ -1312,15 +1476,14 @@ func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
 			}
 		}
 
-		// Create markdown image syntax
 		if src != "" {
-			// Check if src is a relative URL
+			originalSrc := src
 			if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
-				// Prepend base URL if relative
 				src = c.config.BaseURL + src
 			}
+			logrus.Debugf("Processing image: original=%s, full=%s", originalSrc, src)
 
-			imgMarkdown := fmt.Sprintf("![%s](%s)", alt, src)
+			imgMarkdown := c.downloadAndEmbedImage(src, alt)
 			w.WriteString(imgMarkdown)
 			return converter.RenderSuccess
 		}
@@ -1333,6 +1496,220 @@ func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
 		return htmlContent
 	}
 	return markdown
+}
+
+// downloadAndEmbedImage downloads an image and returns a base64 embedded markdown image
+func (c *ConfluenceAdapter) downloadAndEmbedImage(src, alt string) string {
+	src = strings.TrimSpace(src)
+	src = strings.Trim(src, "`'\"")
+	src = strings.TrimSuffix(src, ")")
+	src = strings.TrimSuffix(src, "`")
+
+	if src == "" {
+		logrus.Debugf("Empty image source after cleanup")
+		return ""
+	}
+
+	logrus.Infof("Downloading image: %s", src)
+
+	imgMarkdown := fmt.Sprintf("![%s](%s)", alt, src)
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", src, nil)
+	if err != nil {
+		logrus.Warnf("Failed to create image request for %s: %v", src, err)
+		return imgMarkdown
+	}
+
+	if c.config.PersonalAccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.config.PersonalAccessToken)
+		logrus.Debugf("Using PAT authentication for image download")
+	} else {
+		logrus.Debugf("Using session cookie authentication for image download (via cookie jar)")
+	}
+	req.Header.Set("Accept", "image/*")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("X-Atlassian-Token", "no-check")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		logrus.Warnf("Failed to download image %s: %v", src, err)
+		return imgMarkdown
+	}
+	defer resp.Body.Close()
+
+	logrus.Debugf("Image response status: %d, Content-Type: %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+
+	if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusSeeOther {
+		location := resp.Header.Get("Location")
+		if location != "" {
+			logrus.Debugf("Image redirected to: %s", location)
+			if !strings.HasPrefix(location, "http") {
+				location = c.config.BaseURL + location
+			}
+			return c.downloadAndEmbedImage(location, alt)
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		logrus.Warnf("Image download failed with status %d for %s", resp.StatusCode, src)
+		return imgMarkdown
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if strings.Contains(contentType, "text/html") {
+		logrus.Warnf("Image URL returned HTML (likely auth redirect): %s", src)
+		return imgMarkdown
+	}
+
+	imgData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logrus.Debugf("Failed to read image data from %s: %v", src, err)
+		return imgMarkdown
+	}
+
+	respContentType := resp.Header.Get("Content-Type")
+	if respContentType == "" {
+		respContentType = http.DetectContentType(imgData)
+	}
+
+	mimeType := "image/png"
+	if strings.HasPrefix(respContentType, "image/") {
+		mimeType = respContentType
+	}
+
+	base64Data := base64.StdEncoding.EncodeToString(imgData)
+	logrus.Debugf("Successfully embedded image: %s (%d bytes, %s)", src, len(imgData), mimeType)
+
+	return fmt.Sprintf("![%s](data:%s;base64,%s)", alt, mimeType, base64Data)
+}
+
+// preprocessConfluenceImages converts Confluence-specific image tags to standard img tags
+// Confluence uses <ac:image> and <ri:attachment> or <ri:url> tags
+func (c *ConfluenceAdapter) preprocessConfluenceImages(htmlContent string) string {
+	acImageRegex := regexp.MustCompile(`<ac:image[^>]*>([\s\S]*?)</ac:image>`)
+
+	result := acImageRegex.ReplaceAllStringFunc(htmlContent, func(match string) string {
+		alt := ""
+		var src string
+		srcType := ""
+
+		altRegex := regexp.MustCompile(`ac:alt="([^"]*)"`)
+		if altMatches := altRegex.FindStringSubmatch(match); len(altMatches) > 1 {
+			alt = altMatches[1]
+		}
+
+		attachmentRegex := regexp.MustCompile(`<ri:attachment[^>]*ri:filename="([^"]*)"[^>]*/>`)
+		if attachmentMatches := attachmentRegex.FindStringSubmatch(match); len(attachmentMatches) > 1 {
+			src = attachmentMatches[1]
+			srcType = "attachment"
+		}
+
+		urlRegex := regexp.MustCompile(`<ri:url[^>]*ri:value="([^"]*)"[^>]*/>`)
+		if urlMatches := urlRegex.FindStringSubmatch(match); len(urlMatches) > 1 {
+			src = urlMatches[1]
+			srcType = "url"
+		}
+
+		if src == "" {
+			logrus.Debugf("No image source found in Confluence image tag: %s", match)
+			return ""
+		}
+
+		logrus.Debugf("Found Confluence image: type=%s, src=%s, alt=%s", srcType, src, alt)
+
+		if srcType == "attachment" {
+			imgMarkdown := c.downloadConfluenceAttachment(src, alt)
+			return imgMarkdown
+		} else if srcType == "url" {
+			if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+				src = c.config.BaseURL + src
+			}
+			imgMarkdown := c.downloadAndEmbedImage(src, alt)
+			return imgMarkdown
+		}
+
+		return fmt.Sprintf("![%s](%s)", alt, src)
+	})
+
+	return result
+}
+
+// downloadConfluenceAttachment downloads a Confluence attachment and returns embedded markdown
+func (c *ConfluenceAdapter) downloadConfluenceAttachment(filename, alt string) string {
+	u, _ := url.Parse(c.config.BaseURL)
+	cookies := c.cookieJar.Cookies(u)
+	if len(cookies) == 0 {
+		if err := c.loginAndGetSessionCookies(); err != nil {
+			logrus.Warnf("Failed to login for attachment download: %v", err)
+		}
+	}
+
+	apiURL := fmt.Sprintf("%s/rest/api/content/%s/child/attachment?filename=%s", c.config.BaseURL, c.currentPageID, url.QueryEscape(filename))
+	logrus.Debugf("Fetching attachment info from API: %s", apiURL)
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", apiURL, nil)
+	if err != nil {
+		logrus.Warnf("Failed to create attachment API request: %v", err)
+		return ""
+	}
+
+	req.SetBasicAuth(c.config.Username, c.config.APIKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		logrus.Warnf("Failed to fetch attachment info: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		logrus.Warnf("Attachment API returned status %d", resp.StatusCode)
+		return ""
+	}
+
+	var attachmentResp struct {
+		Results []struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+			Links struct {
+				Download string `json:"download"`
+			} `json:"_links"`
+		} `json:"results"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&attachmentResp); err != nil {
+		logrus.Warnf("Failed to decode attachment response: %v", err)
+		return ""
+	}
+
+	if len(attachmentResp.Results) == 0 {
+		logrus.Warnf("No attachment found with filename: %s", filename)
+		return ""
+	}
+
+	attachment := attachmentResp.Results[0]
+	downloadLink := attachment.Links.Download
+	logrus.Debugf("Found attachment ID: %s, Title: %s, Download: %s", attachment.ID, attachment.Title, downloadLink)
+
+	if downloadLink == "" {
+		logrus.Warnf("No download link found for attachment: %s", filename)
+		return ""
+	}
+
+	if !strings.HasPrefix(downloadLink, "http") {
+		downloadLink = c.config.BaseURL + downloadLink
+	}
+
+	if strings.Contains(downloadLink, "?") {
+		downloadLink = downloadLink + "&download=true"
+	} else {
+		downloadLink = downloadLink + "?download=true"
+	}
+
+	logrus.Debugf("Downloading attachment with session cookie: %s", downloadLink)
+
+	return c.downloadAndEmbedImage(downloadLink, alt)
 }
 
 // htmlToText converts HTML content to plain text
@@ -1396,31 +1773,41 @@ func (c *ConfluenceAdapter) extractText(n *html.Node, text *strings.Builder) {
 
 // sanitizeFilename converts a title to a safe filename
 func (c *ConfluenceAdapter) SanitizeFilename(title string) string {
-	// Convert to lowercase and replace spaces with underscores
 	filename := strings.ToLower(title)
 
-	// Replace special characters with underscores (but preserve dots for extensions)
 	reg := regexp.MustCompile(`[^a-z0-9\s_.-]`)
 	filename = reg.ReplaceAllString(filename, "_")
 
-	// Replace spaces and multiple underscores with single underscore
 	reg = regexp.MustCompile(`[\s_]+`)
 	filename = reg.ReplaceAllString(filename, "_")
 
-	// Remove leading/trailing underscores
 	filename = strings.Trim(filename, "_")
 
-	// Limit length to 100 characters
 	if len(filename) > 100 {
 		filename = filename[:100]
 	}
 
-	// Ensure it's not empty
 	if filename == "" {
 		filename = "untitled"
 	}
 
 	return filename
+}
+
+// generateUniqueFilename generates a unique filename using title and page ID
+func (c *ConfluenceAdapter) generateUniqueFilename(title, pageID string, useMarkdown bool) string {
+	sanitizedTitle := c.SanitizeFilename(title)
+
+	ext := ".txt"
+	if useMarkdown {
+		ext = ".md"
+	}
+
+	if sanitizedTitle == "untitled" || len(sanitizedTitle) < 3 {
+		return fmt.Sprintf("%s%s", pageID, ext)
+	}
+
+	return fmt.Sprintf("%s_%s%s", sanitizedTitle, pageID, ext)
 }
 
 // GetLastSync returns the last sync time
