@@ -1286,18 +1286,21 @@ func (c *ConfluenceAdapter) fetchBlogpostBody(ctx context.Context, blogpostID st
 
 // HtmlToMarkdown converts HTML content to markdown
 func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
-	// Store reference to ConfluenceAdapter for use in plugin
-	adapter := c
-	
-	// Custom image processor plugin
-	imagePlugin := converter.PluginFunc(func(c *converter.Converter, root *html.Node) {
-		var processImage func(*html.Node)
-		processImage = func(n *html.Node) {
-			if n.Type == html.ElementNode && n.Data == "img" {
+	// Create a custom converter with image handling
+	conv := converter.NewConverter(
+		converter.WithPlugins(
+			base.NewBasePlugin(),
+			commonmark.NewCommonmarkPlugin(
+				commonmark.WithStrongDelimiter("__"),
+			),
+			table.NewTablePlugin(),
+		),
+		converter.WithNodeConverter(func(node *html.Node) (string, bool, error) {
+			if node.Type == html.ElementNode && node.Data == "img" {
 				// Get image src and alt attributes
 				src := ""
 				alt := ""
-				for _, attr := range n.Attr {
+				for _, attr := range node.Attr {
 					if attr.Key == "src" {
 						src = attr.Val
 					} else if attr.Key == "alt" {
@@ -1310,39 +1313,15 @@ func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
 					// Check if src is a relative URL
 					if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
 						// Prepend base URL if relative
-						src = adapter.config.BaseURL + src
+						src = c.config.BaseURL + src
 					}
 					
-					// Replace the img node with text node containing markdown image
 					imgMarkdown := fmt.Sprintf("![%s](%s)", alt, src)
-					n.Type = html.TextNode
-					n.Data = imgMarkdown
-					n.Attr = nil
-					// Remove all children
-					for n.FirstChild != nil {
-						n.RemoveChild(n.FirstChild)
-					}
+					return imgMarkdown, true, nil
 				}
 			}
-			
-			// Process child nodes
-			for child := n.FirstChild; child != nil; child = child.NextSibling {
-				processImage(child)
-			}
-		}
-		
-		processImage(root)
-	})
-	
-	conv := converter.NewConverter(
-		converter.WithPlugins(
-			base.NewBasePlugin(),
-			commonmark.NewCommonmarkPlugin(
-				commonmark.WithStrongDelimiter("__"),
-			),
-			table.NewTablePlugin(),
-			imagePlugin,
-		),
+			return "", false, nil
+		}),
 	)
 	markdown, err := conv.ConvertString(htmlContent)
 	if err != nil {
