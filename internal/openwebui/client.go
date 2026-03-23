@@ -8,6 +8,8 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/openwebui-content-sync/internal/utils"
@@ -80,10 +82,30 @@ func (c *Client) UploadFile(ctx context.Context, filename string, content []byte
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
-	// Add file field
-	fileWriter, err := writer.CreateFormFile("file", filename)
+	// Determine content type based on file extension
+	contentType := "application/octet-stream"
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch ext {
+	case ".md":
+		contentType = "text/markdown"
+	case ".txt":
+		contentType = "text/plain"
+	case ".pdf":
+		contentType = "application/pdf"
+	case ".doc", ".docx":
+		contentType = "application/msword"
+	case ".html", ".htm":
+		contentType = "text/html"
+	}
+
+	// Create a custom header for the file part with proper content type
+	h := make(map[string][]string)
+	h["Content-Type"] = []string{contentType}
+	h["Content-Disposition"] = []string{fmt.Sprintf(`form-data; name="file"; filename="%s"`, filename)}
+
+	fileWriter, err := writer.CreatePart(h)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create form file: %w", err)
+		return nil, fmt.Errorf("failed to create form file part: %w", err)
 	}
 
 	if _, err := fileWriter.Write(content); err != nil {
@@ -216,12 +238,14 @@ func (c *Client) ListKnowledge(ctx context.Context) ([]*Knowledge, error) {
 		return nil, fmt.Errorf("list knowledge failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var knowledge []*Knowledge
-	if err := json.NewDecoder(resp.Body).Decode(&knowledge); err != nil {
+	var response struct {
+		Data []*Knowledge `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	return knowledge, nil
+	return response.Data, nil
 }
 
 // AddFileToKnowledge adds a file to a knowledge source
@@ -282,6 +306,48 @@ func (c *Client) AddFileToKnowledge(ctx context.Context, knowledgeID, fileID str
 	return nil
 }
 
+// GetFileProcessingStatus retrieves the processing status of a file
+func (c *Client) GetFileProcessingStatus(ctx context.Context, fileID string) (string, error) {
+	url := fmt.Sprintf("%s/api/v1/files/%s/process/status", c.baseURL, fileID)
+
+	logrus.Debugf("Getting file processing status: %s", fileID)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		logrus.Errorf("Get file processing status failed with status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("get file processing status failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var statusResponse struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&statusResponse); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if statusResponse.Error != "" {
+		logrus.Errorf("File processing error: %s", statusResponse.Error)
+	}
+
+	return statusResponse.Status, nil
+}
+
 // waitForFileProcessing waits for a file to finish processing with adaptive polling
 // Uses exponential backoff to handle both quick and slow file ingestion
 func (c *Client) waitForFileProcessing(ctx context.Context, fileID string) error {
@@ -324,7 +390,7 @@ func (c *Client) waitForFileProcessing(ctx context.Context, fileID string) error
 			}
 
 			// Get file status
-			file, err := c.GetFile(ctx, fileID)
+			status, err := c.GetFileProcessingStatus(ctx, fileID)
 			if err != nil {
 				logrus.Debugf("After %v: Failed to get file status: %v", elapsed.Round(time.Second), err)
 				time.Sleep(interval.delay)
@@ -332,17 +398,17 @@ func (c *Client) waitForFileProcessing(ctx context.Context, fileID string) error
 			}
 
 			logrus.Debugf("After %v: File %s status: %s (checking every %v)",
-				elapsed.Round(time.Second), fileID, file.Data.Status, interval.delay)
+				elapsed.Round(time.Second), fileID, status, interval.delay)
 
 			// Check if file processing is complete
-			if file.Data.Status == "processed" || file.Data.Status == "completed" || file.Data.Status == "" {
+			if status == "processed" || status == "completed" || status == "" {
 				logrus.Infof("File %s processing completed after %v", fileID, elapsed.Round(time.Second))
 				return nil
 			}
 
 			// If status is error, return immediately
-			if file.Data.Status == "error" || file.Data.Status == "failed" {
-				return fmt.Errorf("file processing failed with status: %s after %v", file.Data.Status, elapsed.Round(time.Second))
+			if status == "error" || status == "failed" {
+				return fmt.Errorf("file processing failed with status: %s after %v", status, elapsed.Round(time.Second))
 			}
 
 			// Wait before next attempt
@@ -539,12 +605,16 @@ func (c *Client) GetKnowledgeFiles(ctx context.Context, knowledgeID string) ([]*
 	//logrus.Debugf("Knowledge files response body: %s", string(body))
 	logrus.Debugf("Response body length: %d bytes", len(body))
 
-	var knowledgeList []*Knowledge
-	if err := json.Unmarshal(body, &knowledgeList); err != nil {
+	var response struct {
+		Data []*Knowledge `json:"data"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
 		logrus.Errorf("Failed to decode knowledge list response: %v", err)
 		//logrus.Errorf("Response body was: %s", string(body))
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
+
+	knowledgeList := response.Data
 
 	//logrus.Debugf("Successfully decoded %d knowledge sources", len(knowledgeList))
 	for i, knowledge := range knowledgeList {

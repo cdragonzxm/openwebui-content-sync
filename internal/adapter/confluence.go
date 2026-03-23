@@ -35,20 +35,20 @@ type ConfluenceAdapter struct {
 
 // ConfluencePageV1 represents a page from Confluence API v1
 type ConfluencePageV1 struct {
-	ID          string                 `json:"id"`
-	Title       string                 `json:"title"`
-	Space       ConfluenceSpaceV1      `json:"space"`
-	Body        ConfluenceBodyV1       `json:"body"`
-	Version     ConfluenceVersionV1    `json:"version"`
-	History     ConfluenceHistoryV1    `json:"history"`
-	Links       map[string]interface{} `json:"_links"`
+	ID      string                 `json:"id"`
+	Title   string                 `json:"title"`
+	Space   ConfluenceSpaceV1      `json:"space"`
+	Body    ConfluenceBodyV1       `json:"body"`
+	Version ConfluenceVersionV1    `json:"version"`
+	History ConfluenceHistoryV1    `json:"history"`
+	Links   map[string]interface{} `json:"_links"`
 }
 
 // ConfluenceSpaceV1 represents a space from Confluence API v1
 type ConfluenceSpaceV1 struct {
-	ID   string `json:"id"`
-	Key  string `json:"key"`
-	Name string `json:"name"`
+	ID   json.Number `json:"id"`
+	Key  string      `json:"key"`
+	Name string      `json:"name"`
 }
 
 // ConfluenceBodyV1 represents the body content for API v1
@@ -437,10 +437,10 @@ func (c *ConfluenceAdapter) getSpaceID(ctx context.Context, spaceKey string) (st
 
 	if c.config.APIVersion == "v1" {
 		// API v1 endpoint
-		url = fmt.Sprintf("%s/wiki/rest/api/space/%s", c.config.BaseURL, encodedSpaceKey)
+		url = fmt.Sprintf("%s/rest/api/space/%s", c.config.BaseURL, encodedSpaceKey)
 	} else {
 		// API v2 endpoint (default)
-		url = fmt.Sprintf("%s/wiki/api/v2/spaces?keys=%s", c.config.BaseURL, encodedSpaceKey)
+		url = fmt.Sprintf("%s/api/v2/spaces?keys=%s", c.config.BaseURL, encodedSpaceKey)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -476,7 +476,7 @@ func (c *ConfluenceAdapter) getSpaceID(ctx context.Context, spaceKey string) (st
 		if err := json.NewDecoder(resp.Body).Decode(&space); err != nil {
 			return "", fmt.Errorf("failed to decode response: %w", err)
 		}
-		spaceID = space.ID
+		spaceID = space.ID.String()
 	} else {
 		// API v2 response parsing
 		var spaceList ConfluenceSpaceList
@@ -510,7 +510,7 @@ func (c *ConfluenceAdapter) fetchSpacePagesV2(ctx context.Context, spaceID strin
 		limit = 100 // Default limit
 	}
 
-	url := fmt.Sprintf("%s/wiki/api/v2/spaces/%s/pages?limit=%d", c.config.BaseURL, spaceID, limit)
+	url := fmt.Sprintf("%s/api/v2/spaces/%s/pages?limit=%d", c.config.BaseURL, spaceID, limit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -604,7 +604,7 @@ func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceID strin
 		limit = 100 // Default limit
 	}
 
-	url := fmt.Sprintf("%s/wiki/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, spaceID, limit)
+	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, spaceID, limit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -641,7 +641,7 @@ func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceID strin
 				ID:                v1Page.ID,
 				Status:            "current",
 				Title:             v1Page.Title,
-				SpaceID:           v1Page.Space.ID,
+				SpaceID:           v1Page.Space.ID.String(),
 				AuthorID:          "", // API v1 doesn't provide account ID
 				AuthorDisplayName: v1Page.History.CreatedBy.DisplayName,
 				CreatedAt:         v1Page.History.CreatedAt,
@@ -690,7 +690,7 @@ func (c *ConfluenceAdapter) fetchPageByID(ctx context.Context, pageID string) (C
 
 // fetchPageByIDV2 fetches a specific page by its ID using API v2
 func (c *ConfluenceAdapter) fetchPageByIDV2(ctx context.Context, pageID string) (ConfluencePage, error) {
-	url := fmt.Sprintf("%s/wiki/api/v2/pages/%s", c.config.BaseURL, pageID)
+	url := fmt.Sprintf("%s/api/v2/pages/%s", c.config.BaseURL, pageID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -724,7 +724,7 @@ func (c *ConfluenceAdapter) fetchPageByIDV2(ctx context.Context, pageID string) 
 
 // fetchPageByIDV1 fetches a specific page by its ID using API v1
 func (c *ConfluenceAdapter) fetchPageByIDV1(ctx context.Context, pageID string) (ConfluencePage, error) {
-	url := fmt.Sprintf("%s/wiki/rest/api/content/%s?expand=body.storage,history.createdBy,space", c.config.BaseURL, pageID)
+	url := fmt.Sprintf("%s/rest/api/content/%s?expand=body.storage,history.createdBy,space", c.config.BaseURL, pageID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -758,7 +758,7 @@ func (c *ConfluenceAdapter) fetchPageByIDV1(ctx context.Context, pageID string) 
 		ID:                v1Page.ID,
 		Status:            "current",
 		Title:             v1Page.Title,
-		SpaceID:           v1Page.Space.ID,
+		SpaceID:           v1Page.Space.ID.String(),
 		AuthorID:          "", // API v1 doesn't provide account ID
 		AuthorDisplayName: v1Page.History.CreatedBy.DisplayName,
 		CreatedAt:         v1Page.History.CreatedAt,
@@ -792,7 +792,7 @@ func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID st
 		limit = 100 // Default limit
 	}
 
-	url := fmt.Sprintf("%s/wiki/api/v2/pages/%s/children?limit=%d", c.config.BaseURL, parentPageID, limit)
+	url := fmt.Sprintf("%s/api/v2/pages/%s/children?limit=%d", c.config.BaseURL, parentPageID, limit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -861,7 +861,7 @@ func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID st
 		limit = 100 // Default limit
 	}
 
-	url := fmt.Sprintf("%s/wiki/rest/api/content/%s/child/page?limit=%d", c.config.BaseURL, parentPageID, limit)
+	url := fmt.Sprintf("%s/rest/api/content/%s/child/page?limit=%d", c.config.BaseURL, parentPageID, limit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -899,7 +899,7 @@ func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID st
 				ID:                childPage.ID,
 				Status:            "current",
 				Title:             childPage.Title,
-				SpaceID:           childPage.Space.ID,
+				SpaceID:           childPage.Space.ID.String(),
 				AuthorID:          "", // API v1 doesn't provide account ID
 				AuthorDisplayName: childPage.History.CreatedBy.DisplayName,
 				CreatedAt:         childPage.History.CreatedAt,
@@ -969,6 +969,8 @@ func (c *ConfluenceAdapter) processPage(ctx context.Context, page ConfluencePage
 	hash := sha256.Sum256(fileContent)
 	contentHash := base64.StdEncoding.EncodeToString(hash[:])
 
+	logrus.Debugf("Generated file content for %s: %d bytes, first 200 chars: %q", filename, len(fileContent), string(fileContent[:min(200, len(fileContent))]))
+
 	return &File{
 		Path:        filename,
 		Content:     fileContent,
@@ -990,7 +992,7 @@ func (c *ConfluenceAdapter) fetchPageBody(ctx context.Context, pageID string) (s
 
 // fetchPageBodyV2 fetches the body content of a specific page using API v2
 func (c *ConfluenceAdapter) fetchPageBodyV2(ctx context.Context, pageID string) (string, error) {
-	url := fmt.Sprintf("%s/wiki/api/v2/pages/%s?body-format=export_view", c.config.BaseURL, pageID)
+	url := fmt.Sprintf("%s/api/v2/pages/%s?body-format=export_view", c.config.BaseURL, pageID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -1031,7 +1033,7 @@ func (c *ConfluenceAdapter) fetchPageBodyV2(ctx context.Context, pageID string) 
 
 // fetchPageBodyV1 fetches the body content of a specific page using API v1
 func (c *ConfluenceAdapter) fetchPageBodyV1(ctx context.Context, pageID string) (string, error) {
-	url := fmt.Sprintf("%s/wiki/rest/api/content/%s?expand=body.storage", c.config.BaseURL, pageID)
+	url := fmt.Sprintf("%s/rest/api/content/%s?expand=body.storage", c.config.BaseURL, pageID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -1078,7 +1080,7 @@ func (c *ConfluenceAdapter) fetchSpaceBlogposts(ctx context.Context, spaceID str
 		limit = 100 // Default limit
 	}
 
-	url := fmt.Sprintf("%s/wiki/api/v2/spaces/%s/blogposts?limit=%d", c.config.BaseURL, spaceID, limit)
+	url := fmt.Sprintf("%s/api/v2/spaces/%s/blogposts?limit=%d", c.config.BaseURL, spaceID, limit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -1166,7 +1168,7 @@ func (c *ConfluenceAdapter) fetchSpaceBlogposts(ctx context.Context, spaceID str
 
 // fetchBlogpostByID fetches a specific blog post by its ID
 func (c *ConfluenceAdapter) fetchBlogpostByID(ctx context.Context, blogpostID string) (ConfluenceBlogPost, error) {
-	url := fmt.Sprintf("%s/wiki/api/v2/blogposts/%s", c.config.BaseURL, blogpostID)
+	url := fmt.Sprintf("%s/api/v2/blogposts/%s", c.config.BaseURL, blogpostID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -1245,7 +1247,7 @@ func (c *ConfluenceAdapter) processBlogpost(ctx context.Context, blogpost Conflu
 
 // fetchBlogpostBody fetches the body content of a specific blog post
 func (c *ConfluenceAdapter) fetchBlogpostBody(ctx context.Context, blogpostID string) (string, error) {
-	url := fmt.Sprintf("%s/wiki/api/v2/blogposts/%s?body-format=export_view", c.config.BaseURL, blogpostID)
+	url := fmt.Sprintf("%s/api/v2/blogposts/%s?body-format=export_view", c.config.BaseURL, blogpostID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -1295,34 +1297,36 @@ func (c *ConfluenceAdapter) HtmlToMarkdown(htmlContent string) string {
 			),
 			table.NewTablePlugin(),
 		),
-		converter.WithNodeConverter(func(node *html.Node) (string, bool, error) {
-			if node.Type == html.ElementNode && node.Data == "img" {
-				// Get image src and alt attributes
-				src := ""
-				alt := ""
-				for _, attr := range node.Attr {
-					if attr.Key == "src" {
-						src = attr.Val
-					} else if attr.Key == "alt" {
-						alt = attr.Val
-					}
-				}
-				
-				// Create markdown image syntax
-				if src != "" {
-					// Check if src is a relative URL
-					if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
-						// Prepend base URL if relative
-						src = c.config.BaseURL + src
-					}
-					
-					imgMarkdown := fmt.Sprintf("![%s](%s)", alt, src)
-					return imgMarkdown, true, nil
-				}
-			}
-			return "", false, nil
-		}),
 	)
+
+	// Register custom image renderer
+	conv.Register.RendererFor("img", converter.TagTypeInline, func(ctx converter.Context, w converter.Writer, node *html.Node) converter.RenderStatus {
+		// Get image src and alt attributes
+		src := ""
+		alt := ""
+		for _, attr := range node.Attr {
+			if attr.Key == "src" {
+				src = attr.Val
+			} else if attr.Key == "alt" {
+				alt = attr.Val
+			}
+		}
+
+		// Create markdown image syntax
+		if src != "" {
+			// Check if src is a relative URL
+			if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+				// Prepend base URL if relative
+				src = c.config.BaseURL + src
+			}
+
+			imgMarkdown := fmt.Sprintf("![%s](%s)", alt, src)
+			w.WriteString(imgMarkdown)
+			return converter.RenderSuccess
+		}
+		return converter.RenderTryNext
+	}, 100)
+
 	markdown, err := conv.ConvertString(htmlContent)
 	if err != nil {
 		logrus.Warnf("Failed to convert HTML to markdown: %v", err)
@@ -1443,7 +1447,7 @@ func (c *ConfluenceAdapter) fetchUsersByIds(ctx context.Context, accountIds []st
 	}
 
 	// Prepare the URL for the bulk user lookup endpoint
-	url := fmt.Sprintf("%s/wiki/api/v2/users-bulk", c.config.BaseURL)
+	url := fmt.Sprintf("%s/api/v2/users-bulk", c.config.BaseURL)
 
 	// Create the request
 	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(body)))
