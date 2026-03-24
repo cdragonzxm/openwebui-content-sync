@@ -470,7 +470,7 @@ func (c *ConfluenceAdapter) FetchFiles(ctx context.Context) ([]*File, error) {
 			logrus.Debugf("Space %s has ID: %s", spaceKey, spaceID)
 
 			// Step 2: Fetch pages from the space
-			pages, err := c.fetchSpacePages(ctx, spaceID)
+			pages, err := c.fetchSpacePages(ctx, spaceID, spaceKey)
 			if err != nil {
 				logrus.Errorf("Failed to fetch pages from space %s: %v", spaceKey, err)
 				continue
@@ -582,10 +582,10 @@ func (c *ConfluenceAdapter) getSpaceID(ctx context.Context, spaceKey string) (st
 	return spaceID, nil
 }
 
-// fetchSpacePages fetches all pages from a space using space ID
-func (c *ConfluenceAdapter) fetchSpacePages(ctx context.Context, spaceID string) ([]ConfluencePage, error) {
+// fetchSpacePages fetches all pages from a space using space ID or space key
+func (c *ConfluenceAdapter) fetchSpacePages(ctx context.Context, spaceID string, spaceKey string) ([]ConfluencePage, error) {
 	if c.config.APIVersion == "v1" {
-		return c.fetchSpacePagesV1(ctx, spaceID)
+		return c.fetchSpacePagesV1(ctx, spaceKey)
 	}
 	return c.fetchSpacePagesV2(ctx, spaceID)
 }
@@ -684,15 +684,15 @@ func (c *ConfluenceAdapter) fetchSpacePagesV2(ctx context.Context, spaceID strin
 	return allPages, nil
 }
 
-// fetchSpacePagesV1 fetches all pages from a space using space ID with API v1
-func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceID string) ([]ConfluencePage, error) {
+// fetchSpacePagesV1 fetches all pages from a space using space key with API v1
+func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceKey string) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
 	limit := c.config.PageLimit
 	if limit <= 0 {
 		limit = 100 // Default limit
 	}
 
-	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, spaceID, limit)
+	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, url.QueryEscape(spaceKey), limit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
