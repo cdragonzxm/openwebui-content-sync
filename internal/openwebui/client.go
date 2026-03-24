@@ -537,6 +537,12 @@ func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
 
 	logrus.Debugf("File delete response status: %d %s", resp.StatusCode, resp.Status)
 
+	// 将 404 视为成功 - 文件已不存在
+	if resp.StatusCode == http.StatusNotFound {
+		logrus.Debugf("File %s not found (already deleted or doesn't exist)", fileID)
+		return nil
+	}
+
 	if resp.StatusCode != 200 && resp.StatusCode != 204 {
 		body, _ := io.ReadAll(resp.Body)
 		logrus.Debugf("File delete response body: %s", string(body))
