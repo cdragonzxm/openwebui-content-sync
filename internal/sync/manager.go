@@ -33,6 +33,9 @@ type FileMetadata struct {
 	KnowledgeID string    `json:"knowledge_id,omitempty"`
 	SyncedAt    time.Time `json:"synced_at"`
 	Modified    time.Time `json:"modified"`
+	// Confluence 特定字段 - 用于避免重复导出 PDF
+	ConfluenceVersion int    `json:"confluence_version,omitempty"` // Confluence 页面版本号
+	PageID            string `json:"page_id,omitempty"`            // Confluence 页面 ID
 }
 
 // NewManager creates a new sync manager
@@ -282,15 +285,21 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 	if exists {
 		logrus.Debugf("Found existing file %s by %s (existing: %s, new: %s)", filename, matchReason, existing.Path, file.Path)
 
-
-		// Check if it's the same content (but only for files from the same source type)
-		// Files from "openwebui" have file IDs as hashes, not content hashes, so we can't compare them
-		if existing.Source != "openwebui" && existing.Hash == file.Hash {
-			logrus.Debugf("File %s unchanged, skipping", file.Path)
+		// 对于 Confluence 文件，优先使用版本号比较（避免重复导出 PDF）
+		if source == "confluence" && file.ConfluenceVersion > 0 && existing.ConfluenceVersion > 0 {
+			if file.PageID == existing.PageID && file.ConfluenceVersion <= existing.ConfluenceVersion {
+				logrus.Debugf("Confluence page %s (ID: %s) version %d <= %d, skipping",
+					file.Path, file.PageID, file.ConfluenceVersion, existing.ConfluenceVersion)
+				return nil
+			}
+			logrus.Infof("Confluence page %s (ID: %s) version changed from %d to %d, updating",
+				file.Path, file.PageID, existing.ConfluenceVersion, file.ConfluenceVersion)
+		} else if existing.Source != "openwebui" && existing.Hash == file.Hash {
+			// 对于非 Confluence 文件或没有版本号的文件，使用 hash 比较
+			logrus.Debugf("File %s unchanged (hash match), skipping", file.Path)
 			return nil
-		}
-		if existing.Source != "openwebui" && existing.Hash != file.Hash {
-			logrus.Infof("File %s has changed, updating", file.Path)
+		} else if existing.Source != "openwebui" && existing.Hash != file.Hash {
+			logrus.Infof("File %s has changed (hash mismatch), updating", file.Path)
 		}
 	}
 
@@ -371,38 +380,38 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 		logrus.Debugf("Adding file %s to knowledge %s", uploadedFile.ID, knowledgeID)
 		if err := m.openwebuiClient.AddFileToKnowledge(ctx, knowledgeID, uploadedFile.ID); err != nil {
 			logrus.Errorf("Failed to add file to knowledge: %v", err)
-			
+
 			// Check if we have fallback content (markdown) to use instead of PDF
 			if len(file.FallbackContent) > 0 && file.FallbackPath != "" {
 				logrus.Infof("Attempting to use markdown fallback for %s", file.Path)
-				
+
 				// Delete the failed PDF file
 				if delErr := m.openwebuiClient.DeleteFile(ctx, uploadedFile.ID); delErr != nil {
 					logrus.Warnf("Failed to delete failed PDF file: %v", delErr)
 				}
-				
+
 				// Upload markdown fallback
 				fallbackUploaded, uploadErr := m.openwebuiClient.UploadFile(ctx, filepath.Base(file.FallbackPath), file.FallbackContent)
 				if uploadErr != nil {
 					return fmt.Errorf("failed to upload markdown fallback: %w", uploadErr)
 				}
-				
+
 				logrus.Debugf("Uploaded markdown fallback: ID=%s", fallbackUploaded.ID)
-				
+
 				// Add fallback to knowledge
 				if addErr := m.openwebuiClient.AddFileToKnowledge(ctx, knowledgeID, fallbackUploaded.ID); addErr != nil {
 					// Clean up the fallback file if adding fails
 					m.openwebuiClient.DeleteFile(ctx, fallbackUploaded.ID)
 					return fmt.Errorf("failed to add markdown fallback to knowledge: %w", addErr)
 				}
-				
+
 				// Update file info for index
 				uploadedFile = fallbackUploaded
 				file.Path = file.FallbackPath
 				file.Content = file.FallbackContent
 				hash := sha256.Sum256(file.FallbackContent)
 				file.Hash = fmt.Sprintf("%x", hash[:])
-				
+
 				logrus.Infof("Successfully used markdown fallback for %s", file.Path)
 			} else {
 				// Clean up the uploaded file if we can't add it to knowledge

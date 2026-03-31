@@ -1079,7 +1079,8 @@ func (c *ConfluenceAdapter) processPage(ctx context.Context, page ConfluencePage
 			var fbErr error
 			fallbackContent, fallbackFilename, fbErr = generateMarkdownContent()
 			if fbErr != nil {
-				logrus.Warnf("Failed to generate markdown fallback for page %s: %v", page.Title, fbErr)
+				// 降级为 info 级别，因为 PDF 已经成功导出，markdown fallback 只是可选功能
+				logrus.Infof("Markdown fallback not available for page %s (PDF export succeeded)", page.Title)
 			}
 		}
 	} else {
@@ -1090,21 +1091,29 @@ func (c *ConfluenceAdapter) processPage(ctx context.Context, page ConfluencePage
 		}
 	}
 
+	// 检查文件内容是否为空（跳过而不是报错）
+	if len(fileContent) == 0 {
+		logrus.Infof("Skipping page %s (ID: %s): content is empty", page.Title, page.ID)
+		return nil, nil
+	}
+
 	hash := sha256.Sum256(fileContent)
 	contentHash := base64.StdEncoding.EncodeToString(hash[:])
 
 	logrus.Debugf("Generated file content for %s: %d bytes", filename, len(fileContent))
 
 	return &File{
-		Path:            filename,
-		Content:         fileContent,
-		Hash:            contentHash,
-		Modified:        c.lastSync,
-		Size:            int64(len(fileContent)),
-		Source:          "confluence",
-		KnowledgeID:     knowledgeID,
-		FallbackPath:    fallbackFilename,
-		FallbackContent: fallbackContent,
+		Path:              filename,
+		Content:           fileContent,
+		Hash:              contentHash,
+		Modified:          c.lastSync,
+		Size:              int64(len(fileContent)),
+		Source:            "confluence",
+		KnowledgeID:       knowledgeID,
+		FallbackPath:      fallbackFilename,
+		FallbackContent:   fallbackContent,
+		ConfluenceVersion: page.Version.Number, // 添加版本号
+		PageID:            page.ID,             // 添加页面 ID
 	}, nil
 }
 
