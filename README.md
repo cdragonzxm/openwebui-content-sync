@@ -449,6 +449,36 @@ type Adapter interface {
 5. **Associate**: Add files to knowledge base
 6. **Index**: Update local file index
 
+## Unit Tests for Sync Behavior
+
+The project includes targeted unit tests to verify that `internal/sync.Manager` correctly synchronizes content between adapters and OpenWebUI knowledge bases in typical page-tree scenarios.
+
+- **Multiple pages added/removed in a space or page tree**
+  - Test: `TestManager_SyncFiles_MultiPageAddAndDelete` in `internal/sync/manager_simple_test.go`
+  - Verifies:
+    - When an adapter returns multiple current pages (e.g. `page-1.md`, `page-2.md`), each page is uploaded once and added to the configured knowledge base.
+    - Pages that existed in the previous sync (tracked in the local `fileIndex`) but are no longer returned by the adapter are treated as orphaned: they are removed from the corresponding knowledge base and deleted from the index. This simulates pages being deleted or removed from a Confluence space or parent subtree and ensures the OpenWebUI knowledge base stays in sync.
+
+- **Single page content updated**
+  - Test: `TestManager_SyncFiles_SinglePageContentUpdate` in `internal/sync/manager_simple_test.go`
+  - Verifies:
+    - When the same logical page (same `Path`) is returned with a different content hash, the manager treats it as an updated page.
+    - The old file is first removed from the knowledge base and its remote file entry is deleted, then a new file is uploaded and added to the knowledge base.
+    - The local `fileIndex` entry for that page is updated with the new hash and file ID so that subsequent syncs correctly detect whether further changes have occurred.
+
+### Running the sync-related tests
+
+From the project root:
+
+```bash
+go test ./internal/sync -run TestManager_SyncFiles_
+```
+
+This command runs only the sync behavior tests described above, which focus on:
+
+- Whether **adds/deletes of multiple pages** in a space or page tree are reflected in the OpenWebUI knowledge base.
+- Whether **content changes to a single page** are propagated in a timely and consistent way to the knowledge base.
+
 ## Monitoring
 
 The application provides structured logging and health checks:

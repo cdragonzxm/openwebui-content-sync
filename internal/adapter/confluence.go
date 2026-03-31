@@ -441,10 +441,16 @@ func (c *ConfluenceAdapter) FetchFiles(ctx context.Context) ([]*File, error) {
 
 			logrus.Debugf("Found %d pages under parent page %s", len(pages), parentPage.Title)
 
-			// Step 3: Process each page
+			// Step 3: Build hierarchical titles and process each page
 			knowledgeID := c.parentPageMappings[parentPageID]
+			titleMap := c.buildHierarchicalTitles(pages)
 			for _, page := range pages {
-				file, err := c.processPage(ctx, page, knowledgeID)
+				pageCopy := page
+				if fullTitle, ok := titleMap[page.ID]; ok && fullTitle != "" {
+					pageCopy.Title = fullTitle
+				}
+
+				file, err := c.processPage(ctx, pageCopy, knowledgeID)
 				if err != nil {
 					logrus.Errorf("Failed to process page %s: %v", page.Title, err)
 					continue
@@ -478,10 +484,16 @@ func (c *ConfluenceAdapter) FetchFiles(ctx context.Context) ([]*File, error) {
 
 			logrus.Debugf("Found %d pages in space %s", len(pages), spaceKey)
 
-			// Step 3: Process each page
+			// Step 3: Build hierarchical titles and process each page
 			knowledgeID := c.spaceMappings[spaceKey]
+			titleMap := c.buildHierarchicalTitles(pages)
 			for _, page := range pages {
-				file, err := c.processPage(ctx, page, knowledgeID)
+				pageCopy := page
+				if fullTitle, ok := titleMap[page.ID]; ok && fullTitle != "" {
+					pageCopy.Title = fullTitle
+				}
+
+				file, err := c.processPage(ctx, pageCopy, knowledgeID)
 				if err != nil {
 					logrus.Errorf("Failed to process page %s: %v", page.Title, err)
 					continue
@@ -593,12 +605,13 @@ func (c *ConfluenceAdapter) fetchSpacePages(ctx context.Context, spaceID string,
 // fetchSpacePagesV2 fetches all pages from a space using space ID with API v2
 func (c *ConfluenceAdapter) fetchSpacePagesV2(ctx context.Context, spaceID string) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
-	limit := c.config.PageLimit
-	if limit <= 0 {
-		limit = 100 // Default limit
+	maxPages := c.config.PageLimit // 0 means no global limit
+	requestLimit := 100
+	if maxPages > 0 && maxPages < requestLimit {
+		requestLimit = maxPages
 	}
 
-	url := fmt.Sprintf("%s/api/v2/spaces/%s/pages?limit=%d", c.config.BaseURL, spaceID, limit)
+	url := fmt.Sprintf("%s/api/v2/spaces/%s/pages?limit=%d", c.config.BaseURL, spaceID, requestLimit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -629,7 +642,23 @@ func (c *ConfluenceAdapter) fetchSpacePagesV2(ctx context.Context, spaceID strin
 		}
 		resp.Body.Close()
 
-		allPages = append(allPages, pageList.Results...)
+		if maxPages > 0 {
+			remaining := maxPages - len(allPages)
+			if remaining <= 0 {
+				break
+			}
+			if len(pageList.Results) > remaining {
+				allPages = append(allPages, pageList.Results[:remaining]...)
+			} else {
+				allPages = append(allPages, pageList.Results...)
+			}
+		} else {
+			allPages = append(allPages, pageList.Results...)
+		}
+
+		if maxPages > 0 && len(allPages) >= maxPages {
+			break
+		}
 
 		// Check for next page
 		nextLink, hasNext := pageList.Links["next"]
@@ -687,12 +716,13 @@ func (c *ConfluenceAdapter) fetchSpacePagesV2(ctx context.Context, spaceID strin
 // fetchSpacePagesV1 fetches all pages from a space using space key with API v1
 func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceKey string) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
-	limit := c.config.PageLimit
-	if limit <= 0 {
-		limit = 100 // Default limit
+	maxPages := c.config.PageLimit // 0 means no global limit
+	requestLimit := 100
+	if maxPages > 0 && maxPages < requestLimit {
+		requestLimit = maxPages
 	}
 
-	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, url.QueryEscape(spaceKey), limit)
+	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, url.QueryEscape(spaceKey), requestLimit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -725,6 +755,9 @@ func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceKey stri
 
 		// Convert v1 pages to v2 format
 		for _, v1Page := range pageList.Results {
+			if maxPages > 0 && len(allPages) >= maxPages {
+				break
+			}
 			page := ConfluencePage{
 				ID:                v1Page.ID,
 				Status:            "current",
@@ -744,6 +777,10 @@ func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceKey stri
 				Links: v1Page.Links,
 			}
 			allPages = append(allPages, page)
+		}
+
+		if maxPages > 0 && len(allPages) >= maxPages {
+			break
 		}
 
 		// Check for next page
@@ -874,18 +911,20 @@ func (c *ConfluenceAdapter) fetchSubPages(ctx context.Context, parentPageID stri
 
 // fetchSubPagesV2 fetches all sub-pages under a specific parent page using API v2 (recursively)
 func (c *ConfluenceAdapter) fetchSubPagesV2(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
-	return c.fetchSubPagesV2Recursive(ctx, parentPageID)
+	var total int
+	return c.fetchSubPagesV2Recursive(ctx, parentPageID, &total)
 }
 
 // fetchSubPagesV2Recursive recursively fetches all sub-pages under a parent page using API v2
-func (c *ConfluenceAdapter) fetchSubPagesV2Recursive(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
+func (c *ConfluenceAdapter) fetchSubPagesV2Recursive(ctx context.Context, parentPageID string, total *int) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
-	limit := c.config.PageLimit
-	if limit <= 0 {
-		limit = 100 // Default limit
+	maxPages := c.config.PageLimit // 0 means no global limit
+	requestLimit := 100
+	if maxPages > 0 && maxPages < requestLimit {
+		requestLimit = maxPages
 	}
 
-	url := fmt.Sprintf("%s/api/v2/pages/%s/children?limit=%d", c.config.BaseURL, parentPageID, limit)
+	url := fmt.Sprintf("%s/api/v2/pages/%s/children?limit=%d", c.config.BaseURL, parentPageID, requestLimit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -916,19 +955,40 @@ func (c *ConfluenceAdapter) fetchSubPagesV2Recursive(ctx context.Context, parent
 		resp.Body.Close()
 
 		for _, childPage := range childPageList.Results {
+			if maxPages > 0 && *total >= maxPages {
+				break
+			}
+			if maxPages > 0 && *total >= maxPages {
+				break
+			}
+			if maxPages > 0 && *total >= maxPages {
+				break
+			}
+
 			fullPage, err := c.fetchPageByID(ctx, childPage.ID)
 			if err != nil {
 				logrus.Errorf("Failed to fetch full page details for %s: %v", childPage.ID, err)
 				continue
 			}
+			// Ensure parent relationship is available for hierarchical naming
+			fullPage.ParentID = parentPageID
 			allPages = append(allPages, fullPage)
+			*total++
 
-			subPages, err := c.fetchSubPagesV2Recursive(ctx, childPage.ID)
+			if maxPages > 0 && *total >= maxPages {
+				continue
+			}
+
+			subPages, err := c.fetchSubPagesV2Recursive(ctx, childPage.ID, total)
 			if err != nil {
 				logrus.Warnf("Failed to fetch sub-pages for %s: %v", childPage.ID, err)
 			} else {
 				allPages = append(allPages, subPages...)
 			}
+		}
+
+		if maxPages > 0 && *total >= maxPages {
+			break
 		}
 
 		nextLink, hasNext := childPageList.Links["next"]
@@ -951,18 +1011,20 @@ func (c *ConfluenceAdapter) fetchSubPagesV2Recursive(ctx context.Context, parent
 
 // fetchSubPagesV1 fetches all sub-pages under a specific parent page using API v1 (recursively)
 func (c *ConfluenceAdapter) fetchSubPagesV1(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
-	return c.fetchSubPagesV1Recursive(ctx, parentPageID)
+	var total int
+	return c.fetchSubPagesV1Recursive(ctx, parentPageID, &total)
 }
 
 // fetchSubPagesV1Recursive recursively fetches all sub-pages under a parent page
-func (c *ConfluenceAdapter) fetchSubPagesV1Recursive(ctx context.Context, parentPageID string) ([]ConfluencePage, error) {
+func (c *ConfluenceAdapter) fetchSubPagesV1Recursive(ctx context.Context, parentPageID string, total *int) ([]ConfluencePage, error) {
 	var allPages []ConfluencePage
-	limit := c.config.PageLimit
-	if limit <= 0 {
-		limit = 100 // Default limit
+	maxPages := c.config.PageLimit // 0 means no global limit
+	requestLimit := 100
+	if maxPages > 0 && maxPages < requestLimit {
+		requestLimit = maxPages
 	}
 
-	url := fmt.Sprintf("%s/rest/api/content/%s/child/page?limit=%d", c.config.BaseURL, parentPageID, limit)
+	url := fmt.Sprintf("%s/rest/api/content/%s/child/page?limit=%d", c.config.BaseURL, parentPageID, requestLimit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -993,6 +1055,10 @@ func (c *ConfluenceAdapter) fetchSubPagesV1Recursive(ctx context.Context, parent
 		resp.Body.Close()
 
 		for _, childPage := range childPageList.Results {
+			if maxPages > 0 && *total >= maxPages {
+				break
+			}
+
 			page := ConfluencePage{
 				ID:                childPage.ID,
 				Status:            "current",
@@ -1011,14 +1077,25 @@ func (c *ConfluenceAdapter) fetchSubPagesV1Recursive(ctx context.Context, parent
 				},
 				Links: childPage.Links,
 			}
+			// Ensure parent relationship is available for hierarchical naming
+			page.ParentID = parentPageID
 			allPages = append(allPages, page)
+			*total++
 
-			subPages, err := c.fetchSubPagesV1Recursive(ctx, childPage.ID)
+			if maxPages > 0 && *total >= maxPages {
+				continue
+			}
+
+			subPages, err := c.fetchSubPagesV1Recursive(ctx, childPage.ID, total)
 			if err != nil {
 				logrus.Warnf("Failed to fetch sub-pages for %s: %v", childPage.ID, err)
 			} else {
 				allPages = append(allPages, subPages...)
 			}
+		}
+
+		if maxPages > 0 && *total >= maxPages {
+			break
 		}
 
 		nextLink, hasNext := childPageList.Links["next"]
@@ -1074,7 +1151,8 @@ func (c *ConfluenceAdapter) processPage(ctx context.Context, page ConfluencePage
 				return nil, err
 			}
 		} else {
-			filename = c.SanitizeFilename(page.Title) + "_" + page.ID + ".pdf"
+			filename = c.generateUniqueFilename(page.Title, page.ID, true)
+			filename = strings.TrimSuffix(filename, ".md") + ".pdf"
 			fileContent = pdfData
 			var fbErr error
 			fallbackContent, fallbackFilename, fbErr = generateMarkdownContent()
@@ -1257,12 +1335,13 @@ func (c *ConfluenceAdapter) fetchPageBodyV1(ctx context.Context, pageID string) 
 // fetchSpaceBlogposts fetches all blog posts from a space using space ID
 func (c *ConfluenceAdapter) fetchSpaceBlogposts(ctx context.Context, spaceID string) ([]ConfluenceBlogPost, error) {
 	var allBlogposts []ConfluenceBlogPost
-	limit := c.config.PageLimit
-	if limit <= 0 {
-		limit = 100 // Default limit
+	maxPages := c.config.PageLimit // 0 means no global limit
+	requestLimit := 100
+	if maxPages > 0 && maxPages < requestLimit {
+		requestLimit = maxPages
 	}
 
-	url := fmt.Sprintf("%s/api/v2/spaces/%s/blogposts?limit=%d", c.config.BaseURL, spaceID, limit)
+	url := fmt.Sprintf("%s/api/v2/spaces/%s/blogposts?limit=%d", c.config.BaseURL, spaceID, requestLimit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -1293,7 +1372,23 @@ func (c *ConfluenceAdapter) fetchSpaceBlogposts(ctx context.Context, spaceID str
 		}
 		resp.Body.Close()
 
-		allBlogposts = append(allBlogposts, blogpostList.Results...)
+		if maxPages > 0 {
+			remaining := maxPages - len(allBlogposts)
+			if remaining <= 0 {
+				break
+			}
+			if len(blogpostList.Results) > remaining {
+				allBlogposts = append(allBlogposts, blogpostList.Results[:remaining]...)
+			} else {
+				allBlogposts = append(allBlogposts, blogpostList.Results...)
+			}
+		} else {
+			allBlogposts = append(allBlogposts, blogpostList.Results...)
+		}
+
+		if maxPages > 0 && len(allBlogposts) >= maxPages {
+			break
+		}
 
 		// Check for next page
 		nextLink, hasNext := blogpostList.Links["next"]
@@ -1782,9 +1877,10 @@ func (c *ConfluenceAdapter) extractText(n *html.Node, text *strings.Builder) {
 
 // sanitizeFilename converts a title to a safe filename
 func (c *ConfluenceAdapter) SanitizeFilename(title string) string {
-	filename := strings.ToLower(title)
+	filename := strings.ToLower(strings.TrimSpace(title))
 
-	reg := regexp.MustCompile(`[^a-z0-9\s_.-]`)
+	// Keep unicode letters/numbers so non-English page titles are preserved.
+	reg := regexp.MustCompile(`[^\p{L}\p{N}\s_.-]`)
 	filename = reg.ReplaceAllString(filename, "_")
 
 	reg = regexp.MustCompile(`[\s_]+`)
@@ -1797,13 +1893,13 @@ func (c *ConfluenceAdapter) SanitizeFilename(title string) string {
 	}
 
 	if filename == "" {
-		filename = "untitled"
+		filename = "page"
 	}
 
 	return filename
 }
 
-// generateUniqueFilename generates a unique filename using title and page ID
+// generateUniqueFilename generates a unique filename using the (possibly hierarchical) title
 func (c *ConfluenceAdapter) generateUniqueFilename(title, pageID string, useMarkdown bool) string {
 	sanitizedTitle := c.SanitizeFilename(title)
 
@@ -1812,11 +1908,53 @@ func (c *ConfluenceAdapter) generateUniqueFilename(title, pageID string, useMark
 		ext = ".md"
 	}
 
-	if sanitizedTitle == "untitled" || len(sanitizedTitle) < 3 {
-		return fmt.Sprintf("%s%s", pageID, ext)
+	return fmt.Sprintf("%s%s", sanitizedTitle, ext)
+}
+
+// buildHierarchicalTitles builds a map of page ID -> full hierarchical title
+// e.g. "Parent / Child / Grandchild"
+func (c *ConfluenceAdapter) buildHierarchicalTitles(pages []ConfluencePage) map[string]string {
+	idToPage := make(map[string]ConfluencePage, len(pages))
+	for _, p := range pages {
+		idToPage[p.ID] = p
 	}
 
-	return fmt.Sprintf("%s_%s%s", sanitizedTitle, pageID, ext)
+	cache := make(map[string]string, len(pages))
+
+	var build func(p ConfluencePage) string
+	build = func(p ConfluencePage) string {
+		if v, ok := cache[p.ID]; ok {
+			return v
+		}
+
+		titles := []string{p.Title}
+		current := p
+		for {
+			parentID := current.ParentID
+			if parentID == "" {
+				break
+			}
+			parent, ok := idToPage[parentID]
+			if !ok {
+				break
+			}
+			// Avoid repeating the same title when parent/child share identical names
+			if len(titles) == 0 || parent.Title != titles[0] {
+				titles = append([]string{parent.Title}, titles...)
+			}
+			current = parent
+		}
+
+		full := strings.Join(titles, " / ")
+		cache[p.ID] = full
+		return full
+	}
+
+	for _, p := range pages {
+		build(p)
+	}
+
+	return cache
 }
 
 // GetLastSync returns the last sync time

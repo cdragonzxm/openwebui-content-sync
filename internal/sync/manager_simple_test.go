@@ -243,3 +243,210 @@ func TestManager_loadFileIndex(t *testing.T) {
 		t.Errorf("Expected file %s to be in index", fileKey)
 	}
 }
+
+// TestManager_SyncFiles_MultiPageAddAndDelete
+// 验证：同一次同步中多个页面被添加，
+// 且之前知识库中存在、但这次已不存在的页面会被标记为孤儿并从知识库删除
+func TestManager_SyncFiles_MultiPageAddAndDelete(t *testing.T) {
+	tempDir := t.TempDir()
+	defer os.RemoveAll(tempDir)
+
+	var uploadCount int
+	var addToKnowledgeCount int
+	var removedFiles []string
+	var deletedFiles []string
+
+	mockClient := &mocks.MockOpenWebUIClient{
+		UploadFileFunc: func(ctx context.Context, filename string, content []byte) (*openwebui.File, error) {
+			uploadCount++
+			return &openwebui.File{
+				ID:       "uploaded-" + filename,
+				Filename: filename,
+			}, nil
+		},
+		ListKnowledgeFunc: func(ctx context.Context) ([]*openwebui.Knowledge, error) {
+			// 对本测试不重要，返回空列表即可
+			return []*openwebui.Knowledge{}, nil
+		},
+		AddFileToKnowledgeFunc: func(ctx context.Context, knowledgeID, fileID string) error {
+			addToKnowledgeCount++
+			return nil
+		},
+		RemoveFileFromKnowledgeFunc: func(ctx context.Context, knowledgeID, fileID string) error {
+			removedFiles = append(removedFiles, fileID)
+			return nil
+		},
+		DeleteFileFunc: func(ctx context.Context, fileID string) error {
+			deletedFiles = append(deletedFiles, fileID)
+			return nil
+		},
+	}
+
+	manager := &Manager{
+		openwebuiClient: mockClient,
+		storagePath:     tempDir,
+		indexPath:       filepath.Join(tempDir, "file_index.json"),
+		fileIndex:       make(map[string]*FileMetadata),
+		knowledgeID:     "kb-multi",
+	}
+
+	// 模拟知识库中已有的老页面（这次同步中被删除）
+	manager.fileIndex["old-page.md"] = &FileMetadata{
+		Path:        "old-page.md",
+		Hash:        "old-hash",
+		FileID:      "file-old",
+		Source:      "openwebui", // 只有 Source=openwebui 的才会在 cleanup 中删除
+		KnowledgeID: "kb-multi",
+		SyncedAt:    time.Now().Add(-time.Hour),
+		Modified:    time.Now().Add(-time.Hour),
+	}
+
+	// 适配器返回两个新页面（相当于新增/当前仍存在的页面树中的页面）
+	mockAdapter := &mocks.MockAdapter{
+		NameFunc: func() string { return "confluence" },
+		FetchFilesFunc: func(ctx context.Context) ([]*adapter.File, error) {
+			return []*adapter.File{
+				{
+					Path:        "page-1.md",
+					Content:     []byte("# Page 1"),
+					Hash:        "hash-1",
+					Modified:    time.Now(),
+					Size:        int64(len("# Page 1")),
+					Source:      "confluence",
+					KnowledgeID: "kb-multi",
+				},
+				{
+					Path:        "page-2.md",
+					Content:     []byte("# Page 2"),
+					Hash:        "hash-2",
+					Modified:    time.Now(),
+					Size:        int64(len("# Page 2")),
+					Source:      "confluence",
+					KnowledgeID: "kb-multi",
+				},
+			}, nil
+		},
+	}
+
+	ctx := context.Background()
+	if err := manager.SyncFiles(ctx, []adapter.Adapter{mockAdapter}); err != nil {
+		t.Fatalf("SyncFiles failed: %v", err)
+	}
+
+	// 两个新页面应各自上传并加入知识库
+	if uploadCount != 2 {
+		t.Errorf("Expected 2 uploads, got %d", uploadCount)
+	}
+	if addToKnowledgeCount != 2 {
+		t.Errorf("Expected 2 AddFileToKnowledge calls, got %d", addToKnowledgeCount)
+	}
+
+	// 老页面应被识别为孤儿并从知识库移除
+	if len(removedFiles) != 1 || removedFiles[0] != "file-old" {
+		t.Errorf("Expected old file to be removed from knowledge once, got %v", removedFiles)
+	}
+
+	// 索引中不应再包含老页面
+	if _, exists := manager.fileIndex["old-page.md"]; exists {
+		t.Errorf("Expected old-page.md to be removed from index")
+	}
+}
+
+// TestManager_SyncFiles_SinglePageContentUpdate
+// 验证：同一个页面内容发生变化时，会更新知识库中的文件
+func TestManager_SyncFiles_SinglePageContentUpdate(t *testing.T) {
+	tempDir := t.TempDir()
+	defer os.RemoveAll(tempDir)
+
+	var uploadCount int
+	var removedFileIDs []string
+	var deletedFileIDs []string
+
+	mockClient := &mocks.MockOpenWebUIClient{
+		UploadFileFunc: func(ctx context.Context, filename string, content []byte) (*openwebui.File, error) {
+			uploadCount++
+			return &openwebui.File{
+				ID:       "new-file-id",
+				Filename: filename,
+			}, nil
+		},
+		AddFileToKnowledgeFunc: func(ctx context.Context, knowledgeID, fileID string) error {
+			return nil
+		},
+		RemoveFileFromKnowledgeFunc: func(ctx context.Context, knowledgeID, fileID string) error {
+			removedFileIDs = append(removedFileIDs, fileID)
+			return nil
+		},
+		DeleteFileFunc: func(ctx context.Context, fileID string) error {
+			deletedFileIDs = append(deletedFileIDs, fileID)
+			return nil
+		},
+	}
+
+	manager := &Manager{
+		openwebuiClient: mockClient,
+		storagePath:     tempDir,
+		indexPath:       filepath.Join(tempDir, "file_index.json"),
+		fileIndex:       make(map[string]*FileMetadata),
+		knowledgeID:     "kb-page",
+	}
+
+	// 预先模拟旧版本页面已在索引和知识库中
+	manager.fileIndex["page.md"] = &FileMetadata{
+		Path:        "page.md",
+		Hash:        "old-hash",
+		FileID:      "old-file-id",
+		Source:      "test-source", // 非 openwebui，走 hash 对比逻辑
+		KnowledgeID: "kb-page",
+		SyncedAt:    time.Now().Add(-time.Hour),
+		Modified:    time.Now().Add(-time.Hour),
+	}
+
+	// 适配器返回同一路径，但内容和 hash 已变化，相当于“改”
+	mockAdapter := &mocks.MockAdapter{
+		NameFunc: func() string { return "test-source" },
+		FetchFilesFunc: func(ctx context.Context) ([]*adapter.File, error) {
+			return []*adapter.File{
+				{
+					Path:        "page.md",
+					Content:     []byte("# New Content"),
+					Hash:        "new-hash",
+					Modified:    time.Now(),
+					Size:        int64(len("# New Content")),
+					Source:      "test-source",
+					KnowledgeID: "kb-page",
+				},
+			}, nil
+		},
+	}
+
+	ctx := context.Background()
+	if err := manager.SyncFiles(ctx, []adapter.Adapter{mockAdapter}); err != nil {
+		t.Fatalf("SyncFiles failed: %v", err)
+	}
+
+	// 内容变化应触发一次新的上传
+	if uploadCount != 1 {
+		t.Errorf("Expected 1 upload for updated page, got %d", uploadCount)
+	}
+
+	// 旧文件应先从知识库移除并删除
+	if len(removedFileIDs) != 1 || removedFileIDs[0] != "old-file-id" {
+		t.Errorf("Expected old file to be removed from knowledge once, got %v", removedFileIDs)
+	}
+	if len(deletedFileIDs) != 1 || deletedFileIDs[0] != "old-file-id" {
+		t.Errorf("Expected old file to be deleted once, got %v", deletedFileIDs)
+	}
+
+	// 索引中的 hash 和 FileID 应更新为新内容
+	meta, exists := manager.fileIndex["page.md"]
+	if !exists {
+		t.Fatalf("Expected page.md to remain in index")
+	}
+	if meta.Hash != "new-hash" {
+		t.Errorf("Expected hash to be updated to 'new-hash', got %s", meta.Hash)
+	}
+	if meta.FileID != "new-file-id" {
+		t.Errorf("Expected FileID to be 'new-file-id', got %s", meta.FileID)
+	}
+}

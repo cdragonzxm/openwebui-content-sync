@@ -1,6 +1,10 @@
 package adapter
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -149,6 +153,7 @@ func TestSanitizeFilename(t *testing.T) {
 		{"file<with>brackets.txt", "file_with_brackets.txt"},
 		{"file|with|pipes.txt", "file_with_pipes.txt"},
 		{"very-long-filename-that-should-be-truncated-because-it-exceeds-the-maximum-length-limit-of-one-hundred-characters.txt", "very-long-filename-that-should-be-truncated-because-it-exceeds-the-maximum-length-limit-of-one-hundr"},
+		{"中文标题", "中文标题"},
 	}
 
 	for _, tt := range tests {
@@ -158,6 +163,86 @@ func TestSanitizeFilename(t *testing.T) {
 				t.Errorf("SanitizeFilename(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestGenerateUniqueFilename_UsesOnlyTitle(t *testing.T) {
+	adapter := &ConfluenceAdapter{}
+
+	got := adapter.generateUniqueFilename("页面标题", "103703529", true)
+	want := "页面标题.md"
+	if got != want {
+		t.Fatalf("generateUniqueFilename() = %q, want %q", got, want)
+	}
+
+	got = adapter.generateUniqueFilename("", "103703529", false)
+	want = "page.txt"
+	if got != want {
+		t.Fatalf("generateUniqueFilename() with empty title = %q, want %q", got, want)
+	}
+}
+
+func TestFetchSpacePagesV2_RespectsGlobalPageLimit(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.URL.Path != "/api/v2/spaces/space-1/pages" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		// next page call includes cursor
+		if r.URL.Query().Get("cursor") == "next" {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": "3", "title": "Page 3"},
+					{"id": "4", "title": "Page 4"},
+				},
+				"_links": map[string]interface{}{},
+			})
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"id": "1", "title": "Page 1"},
+				{"id": "2", "title": "Page 2"},
+			},
+			"_links": map[string]interface{}{
+				"next": "/api/v2/spaces/space-1/pages?cursor=next",
+			},
+		})
+	}))
+	defer server.Close()
+
+	adapter, err := NewConfluenceAdapter(config.ConfluenceConfig{
+		BaseURL:    server.URL,
+		Username:   "test",
+		APIKey:     "test",
+		APIVersion: "v2",
+		PageLimit:  3,
+		SpaceMappings: []config.SpaceMapping{
+			{SpaceKey: "TEST", KnowledgeID: "kb"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewConfluenceAdapter() error = %v", err)
+	}
+	adapter.client = server.Client()
+
+	pages, err := adapter.fetchSpacePagesV2(context.Background(), "space-1")
+	if err != nil {
+		t.Fatalf("fetchSpacePagesV2() error = %v", err)
+	}
+
+	if len(pages) != 3 {
+		t.Fatalf("Expected 3 pages due to PageLimit=3, got %d", len(pages))
+	}
+
+	if requestCount < 2 {
+		t.Fatalf("Expected pagination request to happen, got %d request(s)", requestCount)
 	}
 }
 

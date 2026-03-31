@@ -285,7 +285,14 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 	if exists {
 		logrus.Debugf("Found existing file %s by %s (existing: %s, new: %s)", filename, matchReason, existing.Path, file.Path)
 
-		// 对于 Confluence 文件，优先使用版本号比较（避免重复导出 PDF）
+		// Prefer content-hash comparison when available to avoid unnecessary uploads.
+		if existing.Hash != "" && file.Hash != "" && existing.Hash == file.Hash {
+			logrus.Debugf("File %s unchanged (hash match), skipping upload", file.Path)
+			return nil
+		}
+
+		// For Confluence files with version info, also use version comparison to avoid
+		// re-uploading older or same versions even if hashes differ (e.g. metadata changes).
 		if source == "confluence" && file.ConfluenceVersion > 0 && existing.ConfluenceVersion > 0 {
 			if file.PageID == existing.PageID && file.ConfluenceVersion <= existing.ConfluenceVersion {
 				logrus.Debugf("Confluence page %s (ID: %s) version %d <= %d, skipping",
@@ -294,12 +301,6 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 			}
 			logrus.Infof("Confluence page %s (ID: %s) version changed from %d to %d, updating",
 				file.Path, file.PageID, existing.ConfluenceVersion, file.ConfluenceVersion)
-		} else if existing.Source != "openwebui" && existing.Hash == file.Hash {
-			// 对于非 Confluence 文件或没有版本号的文件，使用 hash 比较
-			logrus.Debugf("File %s unchanged (hash match), skipping", file.Path)
-			return nil
-		} else if existing.Source != "openwebui" && existing.Hash != file.Hash {
-			logrus.Infof("File %s has changed (hash mismatch), updating", file.Path)
 		}
 	}
 
