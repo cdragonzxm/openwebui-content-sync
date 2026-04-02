@@ -33,6 +33,9 @@ func TestConfluenceSpaceKeySyncV1(t *testing.T) {
 		case path == "/rest/api/content":
 			// 验证使用的是 spaceKey 而不是数字 ID
 			spaceKey := r.URL.Query().Get("spaceKey")
+			if expand := r.URL.Query().Get("expand"); spaceKey == "~zhangxiaoming" && expand != "ancestors,version,history.createdBy" {
+				t.Errorf("expected expand=ancestors,version,history.createdBy for hierarchical filenames, got %q", expand)
+			}
 			if spaceKey == "~zhangxiaoming" {
 				// 正确：使用的是原始 space key
 				json.NewEncoder(w).Encode(map[string]interface{}{
@@ -249,6 +252,10 @@ func TestConfluenceSpaceKeySyncV2(t *testing.T) {
 				"id":    "123456",
 				"title": "Test Page",
 				"body": map[string]interface{}{
+					"export_view": map[string]interface{}{
+						"representation": "view",
+						"value":          "<p>Test content</p>",
+					},
 					"storage": map[string]interface{}{
 						"value": "<p>Test content</p>",
 					},

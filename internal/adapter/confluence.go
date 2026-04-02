@@ -23,6 +23,12 @@ import (
 	"golang.org/x/net/html"
 )
 
+// titlePathSlashSplit splits breadcrumb segments on slash (ASCII or fullwidth), with optional spaces.
+var titlePathSlashSplit = regexp.MustCompile(`\s*[/／]\s*`)
+
+// filenameBreadcrumbMaxLevels is parent + current page only (two segments).
+const filenameBreadcrumbMaxLevels = 2
+
 // ConfluenceAdapter implements the Adapter interface for Confluence spaces
 type ConfluenceAdapter struct {
 	client             *http.Client
@@ -36,15 +42,22 @@ type ConfluenceAdapter struct {
 	cookieJar          http.CookieJar    // shared cookie jar for session authentication
 }
 
+// ConfluenceAncestorV1 is a minimal ancestor entry from Confluence REST API v1 (expand=ancestors).
+type ConfluenceAncestorV1 struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
 // ConfluencePageV1 represents a page from Confluence API v1
 type ConfluencePageV1 struct {
-	ID      string                 `json:"id"`
-	Title   string                 `json:"title"`
-	Space   ConfluenceSpaceV1      `json:"space"`
-	Body    ConfluenceBodyV1       `json:"body"`
-	Version ConfluenceVersionV1    `json:"version"`
-	History ConfluenceHistoryV1    `json:"history"`
-	Links   map[string]interface{} `json:"_links"`
+	ID        string                 `json:"id"`
+	Title     string                 `json:"title"`
+	Space     ConfluenceSpaceV1      `json:"space"`
+	Body      ConfluenceBodyV1       `json:"body"`
+	Version   ConfluenceVersionV1    `json:"version"`
+	History   ConfluenceHistoryV1    `json:"history"`
+	Ancestors []ConfluenceAncestorV1 `json:"ancestors"`
+	Links     map[string]interface{} `json:"_links"`
 }
 
 // ConfluenceSpaceV1 represents a space from Confluence API v1
@@ -446,13 +459,14 @@ func (c *ConfluenceAdapter) FetchFiles(ctx context.Context) ([]*File, error) {
 			titleMap := c.buildHierarchicalTitles(pages)
 			for _, page := range pages {
 				pageCopy := page
-				if fullTitle, ok := titleMap[page.ID]; ok && fullTitle != "" {
+				pid := strings.TrimSpace(page.ID)
+				if fullTitle, ok := titleMap[pid]; ok && fullTitle != "" {
 					pageCopy.Title = fullTitle
 				}
 
 				file, err := c.processPage(ctx, pageCopy, knowledgeID)
 				if err != nil {
-					logrus.Errorf("Failed to process page %s: %v", page.Title, err)
+					logrus.Errorf("Failed to process page %s: %v", pageCopy.Title, err)
 					continue
 				}
 				allFiles = append(allFiles, file)
@@ -489,13 +503,14 @@ func (c *ConfluenceAdapter) FetchFiles(ctx context.Context) ([]*File, error) {
 			titleMap := c.buildHierarchicalTitles(pages)
 			for _, page := range pages {
 				pageCopy := page
-				if fullTitle, ok := titleMap[page.ID]; ok && fullTitle != "" {
+				pid := strings.TrimSpace(page.ID)
+				if fullTitle, ok := titleMap[pid]; ok && fullTitle != "" {
 					pageCopy.Title = fullTitle
 				}
 
 				file, err := c.processPage(ctx, pageCopy, knowledgeID)
 				if err != nil {
-					logrus.Errorf("Failed to process page %s: %v", page.Title, err)
+					logrus.Errorf("Failed to process page %s: %v", pageCopy.Title, err)
 					continue
 				}
 				allFiles = append(allFiles, file)
@@ -722,7 +737,8 @@ func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceKey stri
 		requestLimit = maxPages
 	}
 
-	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&limit=%d", c.config.BaseURL, url.QueryEscape(spaceKey), requestLimit)
+	// expand=ancestors: v1 list does not include parentId; ancestors are required for hierarchical filenames.
+	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&limit=%d&expand=ancestors%%2Cversion%%2Chistory.createdBy", c.config.BaseURL, url.QueryEscape(spaceKey), requestLimit)
 
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -775,6 +791,9 @@ func (c *ConfluenceAdapter) fetchSpacePagesV1(ctx context.Context, spaceKey stri
 					},
 				},
 				Links: v1Page.Links,
+			}
+			if n := len(v1Page.Ancestors); n > 0 {
+				page.ParentID = strings.TrimSpace(v1Page.Ancestors[n-1].ID)
 			}
 			allPages = append(allPages, page)
 		}
@@ -1901,7 +1920,7 @@ func (c *ConfluenceAdapter) SanitizeFilename(title string) string {
 
 // generateUniqueFilename generates a unique filename using the (possibly hierarchical) title
 func (c *ConfluenceAdapter) generateUniqueFilename(title, pageID string, useMarkdown bool) string {
-	sanitizedTitle := c.SanitizeFilename(title)
+	sanitizedTitle := c.finalizeFilenameStemFromTitle(title)
 
 	ext := ".txt"
 	if useMarkdown {
@@ -1911,47 +1930,320 @@ func (c *ConfluenceAdapter) generateUniqueFilename(title, pageID string, useMark
 	return fmt.Sprintf("%s%s", sanitizedTitle, ext)
 }
 
-// buildHierarchicalTitles builds a map of page ID -> full hierarchical title
-// e.g. "Parent / Child / Grandchild"
+// normalizeTitleSeparators fixes common Confluence/UI variants so path splitting works reliably.
+func normalizeTitleSeparators(s string) string {
+	repl := strings.NewReplacer(
+		"\u00a0", " ",
+		"\u2000", " ", "\u2001", " ", "\u2002", " ", "\u2003", " ",
+		"\uFF0F", "/",
+		"\uFF3F", "_",
+		"\uFE4F", "_",
+	)
+	s = repl.Replace(s)
+	return strings.TrimSpace(s)
+}
+
+// splitTitleIntoPathSegments splits a title into hierarchy segments. Confluence may use
+// "A / B", "A/B/C", fullwidth slashes, or a single "A_B_C_D" crumb with no slashes; a long leaf
+// title can still embed many underscore-separated crumbs when parentId is present.
+func splitTitleIntoPathSegments(s string) []string {
+	s = normalizeTitleSeparators(s)
+	if s == "" {
+		return nil
+	}
+	rawParts := titlePathSlashSplit.Split(s, -1)
+	var out []string
+	for _, p := range rawParts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, expandUnderscorePathSegment(p)...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// finalizeReadablePathFromParts deduplicates, trims to maxLevels, and joins with " / " for display.
+func finalizeReadablePathFromParts(parts []string, maxLevels int) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	parts = normalizeBreadcrumbSegments(parts)
+	parts = trimBreadcrumbToMaxLevels(parts, maxLevels)
+	parts = collapseConsecutiveDuplicateSegments(parts)
+	full := strings.Join(parts, " / ")
+	if strings.Contains(full, " / ") {
+		segs := strings.Split(full, " / ")
+		segs = collapseConsecutiveDuplicateSegments(segs)
+		full = strings.Join(segs, " / ")
+	}
+	return full
+}
+
+// finalizeFilenameStemFromTitle is the single place that enforces dedupe + max depth before SanitizeFilename.
+func (c *ConfluenceAdapter) finalizeFilenameStemFromTitle(title string) string {
+	parts := splitTitleIntoPathSegments(title)
+	if len(parts) == 0 {
+		return c.SanitizeFilename("page")
+	}
+	readable := finalizeReadablePathFromParts(parts, filenameBreadcrumbMaxLevels)
+	if readable == "" {
+		return c.SanitizeFilename("page")
+	}
+	return c.SanitizeFilename(readable)
+}
+
+// segmentContentEqual returns true when two breadcrumb segments should be treated as the same
+// for deduplication (trim, exact match, or ASCII case-insensitive match).
+func segmentContentEqual(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == b {
+		return true
+	}
+	return strings.EqualFold(a, b)
+}
+
+// stripLeafIfAncestorsPrefixed removes a redundant breadcrumb embedded in the leaf title.
+// Confluence sometimes returns page.Title as a full path (e.g. "Root / Mid / Leaf"); we already
+// have Root and Mid from ParentID, so joining would duplicate those segments.
+func stripLeafIfAncestorsPrefixed(parts []string) []string {
+	if len(parts) < 2 {
+		return parts
+	}
+	ancestors := parts[:len(parts)-1]
+	leaf := parts[len(parts)-1]
+	if leaf == "" {
+		return parts
+	}
+	prefix := strings.Join(ancestors, " / ")
+	if prefix != "" && strings.HasPrefix(leaf, prefix+" / ") {
+		newLeaf := strings.TrimPrefix(leaf, prefix+" / ")
+		newLeaf = strings.TrimSpace(newLeaf)
+		if newLeaf == "" {
+			return parts
+		}
+		out := append(append([]string(nil), ancestors...), newLeaf)
+		return stripLeafIfAncestorsPrefixed(out)
+	}
+	return parts
+}
+
+// collapseDuplicateHierarchyPrefix removes a doubled two-level prefix A,A,B,B,... -> A,B,...
+// when the leading four segments are duplicate pairs (fixes filenames like x_x_y_y_rest).
+// Repeats while the pattern holds at the front so chained duplicates are collapsed.
+func collapseDuplicateHierarchyPrefix(parts []string) []string {
+	for len(parts) >= 4 && segmentContentEqual(parts[0], parts[1]) && segmentContentEqual(parts[2], parts[3]) {
+		out := make([]string, 0, len(parts)-2)
+		out = append(out, parts[0], parts[2])
+		out = append(out, parts[4:]...)
+		parts = out
+	}
+	return parts
+}
+
+// trimBreadcrumbToMaxLevels keeps at most max breadcrumb segments for filenames, preferring
+// the deepest path (leaf and nearest ancestors) when the tree is deeper than max.
+func trimBreadcrumbToMaxLevels(parts []string, max int) []string {
+	if max <= 0 || len(parts) <= max {
+		return parts
+	}
+	return parts[len(parts)-max:]
+}
+
+// collapseConsecutiveDuplicateSegments removes adjacent duplicate titles (e.g. A,A,B,B,C -> A,B,C).
+func collapseConsecutiveDuplicateSegments(parts []string) []string {
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if len(out) == 0 || !segmentContentEqual(p, out[len(out)-1]) {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return parts
+	}
+	return out
+}
+
+func splitUnderscoreNonEmpty(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, "_") {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// expandUnderscorePathSegment splits "a_b_c_d" style crumbs inside one breadcrumb level when
+// that looks like an embedded path (many parts or duplicate consecutive segments). Short two-part
+// names like "hello_world" stay one segment.
+func expandUnderscorePathSegment(p string) []string {
+	if !strings.Contains(p, "_") {
+		return []string{p}
+	}
+	parts := splitUnderscoreNonEmpty(p)
+	if len(parts) <= 2 {
+		return []string{p}
+	}
+	deduped := collapseConsecutiveDuplicateSegments(parts)
+	if len(parts) >= 4 || len(deduped) < len(parts) {
+		return deduped
+	}
+	return []string{p}
+}
+
+// normalizeBreadcrumbSegments applies strip, AABB collapse, and consecutive dedupe a few times
+// so chained duplicates (including after case normalization) are fully removed.
+func normalizeBreadcrumbSegments(parts []string) []string {
+	for i := 0; i < 3; i++ {
+		parts = stripLeafIfAncestorsPrefixed(parts)
+		parts = collapseDuplicateHierarchyPrefix(parts)
+		parts = collapseConsecutiveDuplicateSegments(parts)
+	}
+	return parts
+}
+
+// normalizePageTitleForPair reduces a page Title field for naming: slash paths use the last
+// segment; underscore paths collapse consecutive duplicate crumbs and, if still very long (>=4
+// segments), keep only the last segment as the page short name.
+func normalizePageTitleForPair(s string) string {
+	s = normalizeTitleSeparators(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, " / ") {
+		parts := strings.Split(s, " / ")
+		return strings.TrimSpace(parts[len(parts)-1])
+	}
+	rawParts := titlePathSlashSplit.Split(s, -1)
+	if len(rawParts) > 1 {
+		for i := len(rawParts) - 1; i >= 0; i-- {
+			if t := strings.TrimSpace(rawParts[i]); t != "" {
+				return t
+			}
+		}
+	}
+	if strings.Contains(s, "_") {
+		parts := splitUnderscoreNonEmpty(s)
+		if len(parts) >= 2 {
+			parts = collapseConsecutiveDuplicateSegments(parts)
+		}
+		if len(parts) >= 4 {
+			return parts[len(parts)-1]
+		}
+		if len(parts) >= 2 {
+			return strings.Join(parts, "_")
+		}
+	}
+	return s
+}
+
+// dedupeChildTokensAgainstParentTokens drops underscore-separated tokens from child that repeat
+// any token in parent (or the parent string as a whole), so filenames stay parent_child without
+// repeated words across the two titles.
+func dedupeChildTokensAgainstParentTokens(parent, child string) string {
+	parent = strings.TrimSpace(parent)
+	child = strings.TrimSpace(child)
+	if parent == "" {
+		return child
+	}
+	pt := splitUnderscoreNonEmpty(parent)
+	if len(pt) == 0 {
+		pt = []string{parent}
+	}
+	ct := splitUnderscoreNonEmpty(child)
+	if len(ct) == 0 {
+		return child
+	}
+	var out []string
+	for _, t := range ct {
+		remove := false
+		if segmentContentEqual(t, parent) {
+			remove = true
+		} else {
+			for _, p := range pt {
+				if segmentContentEqual(t, p) {
+					remove = true
+					break
+				}
+			}
+		}
+		if !remove {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return child
+	}
+	return strings.Join(out, "_")
+}
+
+// buildParentChildDisplayTitle returns "parent / child" using only the immediate parent's title
+// and the current page title, with cross-title token deduplication.
+func (c *ConfluenceAdapter) buildParentChildDisplayTitle(p ConfluencePage, idToPage map[string]ConfluencePage) string {
+	child := normalizePageTitleForPair(p.Title)
+	if child == "" {
+		child = "page"
+	}
+	pid := strings.TrimSpace(p.ParentID)
+	if pid == "" {
+		return child
+	}
+	parent, ok := idToPage[pid]
+	if !ok {
+		return child
+	}
+	par := normalizePageTitleForPair(parent.Title)
+	if par == "" {
+		return child
+	}
+	if segmentContentEqual(par, child) {
+		return child
+	}
+	childDeduped := dedupeChildTokensAgainstParentTokens(par, child)
+	if strings.TrimSpace(childDeduped) == "" {
+		childDeduped = child
+	}
+	if segmentContentEqual(par, childDeduped) {
+		return childDeduped
+	}
+	return par + " / " + childDeduped
+}
+
+// buildHierarchicalTitles builds a map of page ID -> display title for file naming: only the
+// immediate parent page title and the current page title, with duplicate tokens removed.
 func (c *ConfluenceAdapter) buildHierarchicalTitles(pages []ConfluencePage) map[string]string {
 	idToPage := make(map[string]ConfluencePage, len(pages))
 	for _, p := range pages {
-		idToPage[p.ID] = p
+		id := strings.TrimSpace(p.ID)
+		if id == "" {
+			continue
+		}
+		q := p
+		q.ID = id
+		q.ParentID = strings.TrimSpace(p.ParentID)
+		idToPage[id] = q
 	}
 
 	cache := make(map[string]string, len(pages))
-
-	var build func(p ConfluencePage) string
-	build = func(p ConfluencePage) string {
-		if v, ok := cache[p.ID]; ok {
-			return v
-		}
-
-		titles := []string{p.Title}
-		current := p
-		for {
-			parentID := current.ParentID
-			if parentID == "" {
-				break
-			}
-			parent, ok := idToPage[parentID]
-			if !ok {
-				break
-			}
-			// Avoid repeating the same title when parent/child share identical names
-			if len(titles) == 0 || parent.Title != titles[0] {
-				titles = append([]string{parent.Title}, titles...)
-			}
-			current = parent
-		}
-
-		full := strings.Join(titles, " / ")
-		cache[p.ID] = full
-		return full
-	}
-
 	for _, p := range pages {
-		build(p)
+		id := strings.TrimSpace(p.ID)
+		if id == "" {
+			continue
+		}
+		pp, ok := idToPage[id]
+		if !ok {
+			continue
+		}
+		cache[id] = c.buildParentChildDisplayTitle(pp, idToPage)
 	}
 
 	return cache
