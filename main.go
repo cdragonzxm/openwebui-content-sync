@@ -99,7 +99,7 @@ func main() {
 	}
 
 	// Initialize sync manager
-	syncManager, err := sync.NewManager(cfg.OpenWebUI, cfg.Storage)
+	syncManager, err := sync.NewManager(cfg.OpenWebUI, cfg.Storage, cfg.SyncMode)
 	if err != nil {
 		logrus.Fatalf("Failed to create sync manager: %v", err)
 	}

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,7 +26,7 @@ func TestNewManager(t *testing.T) {
 		Path: tempDir,
 	}
 
-	manager, err := NewManager(openwebuiConfig, storageConfig)
+	manager, err := NewManager(openwebuiConfig, storageConfig, "incremental")
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)
 	}
@@ -448,5 +449,252 @@ func TestManager_SyncFiles_SinglePageContentUpdate(t *testing.T) {
 	}
 	if meta.FileID != "new-file-id" {
 		t.Errorf("Expected FileID to be 'new-file-id', got %s", meta.FileID)
+	}
+}
+
+func TestManager_syncFile_ConfluenceVersionUnchanged(t *testing.T) {
+	tempDir := t.TempDir()
+	defer os.RemoveAll(tempDir)
+
+	mockClient := &mocks.MockOpenWebUIClient{
+		UploadFileFunc: func(ctx context.Context, filename string, content []byte) (*openwebui.File, error) {
+			t.Fatalf("UploadFile should not be called when Confluence version is unchanged")
+			return nil, nil
+		},
+	}
+
+	manager := &Manager{
+		openwebuiClient: mockClient,
+		storagePath:     tempDir,
+		fileIndex:       make(map[string]*FileMetadata),
+	}
+
+	// Simulate an already-synced Confluence page with version=5.
+	manager.fileIndex["page.md"] = &FileMetadata{
+		Path:              "page.md",
+		Hash:              "old-hash",
+		FileID:            "old-file-id",
+		Source:            "confluence",
+		ConfluenceVersion: 5,
+		PageID:            "page-123",
+		SyncedAt:          time.Now().Add(-time.Hour),
+		Modified:          time.Now().Add(-time.Hour),
+	}
+
+	file := &adapter.File{
+		Path:              "page.md",
+		Content:           []byte("# New Content"),
+		Hash:              "new-hash", // hash differs, but version is unchanged
+		Modified:          time.Now(),
+		Source:            "confluence",
+		ConfluenceVersion: 5,
+		PageID:            "page-123",
+	}
+
+	ctx := context.Background()
+	if err := manager.syncFile(ctx, file, "confluence"); err != nil {
+		t.Fatalf("syncFile failed: %v", err)
+	}
+
+	// Since version is unchanged, it should keep old OpenWebUI file id.
+	meta := manager.fileIndex["page.md"]
+	if meta.FileID != "old-file-id" {
+		t.Errorf("Expected FileID to remain 'old-file-id', got %s", meta.FileID)
+	}
+	if meta.Hash != "old-hash" {
+		t.Errorf("Expected Hash to remain 'old-hash', got %s", meta.Hash)
+	}
+}
+
+func TestManager_syncFile_NewConfluenceFile_StoresVersion(t *testing.T) {
+	tempDir := t.TempDir()
+	defer os.RemoveAll(tempDir)
+
+	mockClient := &mocks.MockOpenWebUIClient{
+		UploadFileFunc: func(ctx context.Context, filename string, content []byte) (*openwebui.File, error) {
+			return &openwebui.File{
+				ID:       "new-file-id",
+				Filename: filename,
+			}, nil
+		},
+	}
+
+	manager := &Manager{
+		openwebuiClient: mockClient,
+		storagePath:     tempDir,
+		fileIndex:       make(map[string]*FileMetadata),
+	}
+
+	file := &adapter.File{
+		Path:              "page.md",
+		Content:           []byte("# New Content"),
+		Hash:              "content-hash",
+		Modified:          time.Now(),
+		Source:            "confluence",
+		ConfluenceVersion: 7,
+		PageID:            "page-123",
+	}
+
+	ctx := context.Background()
+	if err := manager.syncFile(ctx, file, "confluence"); err != nil {
+		t.Fatalf("syncFile failed: %v", err)
+	}
+
+	meta, exists := manager.fileIndex["page.md"]
+	if !exists {
+		t.Fatalf("Expected page.md to be added to fileIndex")
+	}
+	if meta.ConfluenceVersion != 7 {
+		t.Errorf("Expected ConfluenceVersion=7, got %d", meta.ConfluenceVersion)
+	}
+	if meta.PageID != "page-123" {
+		t.Errorf("Expected PageID='page-123', got %s", meta.PageID)
+	}
+}
+
+func TestManager_syncFile_AddFileToKnowledge_DuplicateContent(t *testing.T) {
+	tempDir := t.TempDir()
+	defer os.RemoveAll(tempDir)
+
+	var uploadCount int
+
+	mockClient := &mocks.MockOpenWebUIClient{
+		UploadFileFunc: func(ctx context.Context, filename string, content []byte) (*openwebui.File, error) {
+			uploadCount++
+			// This test expects only the primary upload; fallback upload must not be triggered on duplicate content.
+			if uploadCount > 1 {
+				t.Fatalf("UploadFile called more than once (uploadCount=%d)", uploadCount)
+			}
+			return &openwebui.File{
+				ID:       "new-file-id",
+				Filename: filename,
+			}, nil
+		},
+		AddFileToKnowledgeFunc: func(ctx context.Context, knowledgeID, fileID string) error {
+			return fmt.Errorf("add file to knowledge failed with status 400: {\"detail\":\"400: Duplicate content detected. Please provide unique content to proceed.\"}")
+		},
+		GetKnowledgeFilesFunc: func(ctx context.Context, knowledgeID string) ([]*openwebui.File, error) {
+			return []*openwebui.File{
+				{
+					ID:       "existing-file-id",
+					Filename: "page.md",
+				},
+			}, nil
+		},
+	}
+
+	manager := &Manager{
+		openwebuiClient: mockClient,
+		storagePath:     tempDir,
+		fileIndex:       make(map[string]*FileMetadata),
+		knowledgeID:     "kb-dup",
+	}
+
+	file := &adapter.File{
+		Path:              "page.md",
+		Content:           []byte("# Page"),
+		Hash:              "content-hash",
+		Modified:          time.Now(),
+		Source:            "confluence",
+		ConfluenceVersion: 10,
+		PageID:            "page-1",
+		// Fallback fields present, but should not be used because duplicate content is handled.
+		FallbackPath:      "page.md",
+		FallbackContent:   []byte("# Page"),
+	}
+
+	ctx := context.Background()
+	if err := manager.syncFile(ctx, file, "confluence"); err != nil {
+		t.Fatalf("syncFile failed: %v", err)
+	}
+
+	meta, ok := manager.fileIndex["page.md"]
+	if !ok {
+		t.Fatalf("Expected page.md to be added to fileIndex")
+	}
+	if meta.FileID != "existing-file-id" {
+		t.Errorf("Expected FileID to reuse existing file on duplicate, got %s", meta.FileID)
+	}
+}
+
+func TestManager_syncFile_FullSync_ReplacesUnchangedFile(t *testing.T) {
+	tempDir := t.TempDir()
+	defer os.RemoveAll(tempDir)
+
+	var uploadCount int
+	var removedFileIDs []string
+	var deletedFileIDs []string
+
+	mockClient := &mocks.MockOpenWebUIClient{
+		UploadFileFunc: func(ctx context.Context, filename string, content []byte) (*openwebui.File, error) {
+			uploadCount++
+			return &openwebui.File{
+				ID:       "new-file-id",
+				Filename: filename,
+			}, nil
+		},
+		AddFileToKnowledgeFunc: func(ctx context.Context, knowledgeID, fileID string) error {
+			return nil
+		},
+		RemoveFileFromKnowledgeFunc: func(ctx context.Context, knowledgeID, fileID string) error {
+			removedFileIDs = append(removedFileIDs, fileID)
+			return nil
+		},
+		DeleteFileFunc: func(ctx context.Context, fileID string) error {
+			deletedFileIDs = append(deletedFileIDs, fileID)
+			return nil
+		},
+	}
+
+	manager := &Manager{
+		openwebuiClient: mockClient,
+		storagePath:     tempDir,
+		fileIndex:       make(map[string]*FileMetadata),
+		knowledgeID:     "kb-full",
+		fullSync:        true,
+	}
+
+	// Existing file has the same hash; in fullSync we should still remove & re-upload.
+	manager.fileIndex["page.md"] = &FileMetadata{
+		Path:              "page.md",
+		Hash:              "same-hash",
+		FileID:            "old-file-id",
+		Source:            "test-source",
+		KnowledgeID:      "kb-full",
+		ConfluenceVersion: 1,
+		PageID:            "page-1",
+		SyncedAt:          time.Now().Add(-time.Hour),
+		Modified:          time.Now().Add(-time.Hour),
+	}
+
+	file := &adapter.File{
+		Path:              "page.md",
+		Content:           []byte("# same content"),
+		Hash:              "same-hash",
+		Modified:          time.Now(),
+		Source:            "test-source",
+		ConfluenceVersion: 1,
+		PageID:            "page-1",
+		KnowledgeID:       "kb-full",
+	}
+
+	ctx := context.Background()
+	if err := manager.syncFile(ctx, file, "test-source"); err != nil {
+		t.Fatalf("syncFile failed: %v", err)
+	}
+
+	if uploadCount != 1 {
+		t.Errorf("Expected 1 upload in fullSync, got %d", uploadCount)
+	}
+	if len(removedFileIDs) != 1 || removedFileIDs[0] != "old-file-id" {
+		t.Errorf("Expected old file removed once, got %v", removedFileIDs)
+	}
+	if len(deletedFileIDs) != 1 || deletedFileIDs[0] != "old-file-id" {
+		t.Errorf("Expected old file deleted once, got %v", deletedFileIDs)
+	}
+
+	meta := manager.fileIndex["page.md"]
+	if meta.FileID != "new-file-id" {
+		t.Errorf("Expected FileID updated to new-file-id, got %s", meta.FileID)
 	}
 }

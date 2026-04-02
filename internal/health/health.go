@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 )
@@ -25,7 +26,7 @@ func NewServer(port int) *Server {
 	mux := http.NewServeMux()
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
 		Handler: mux,
 	}
 
@@ -42,7 +43,15 @@ func NewServer(port int) *Server {
 
 // Start starts the health check server
 func (s *Server) Start() error {
-	return s.server.ListenAndServe()
+	ln, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return err
+	}
+
+	// For port=0, Update Addr to the real listening address (ip:port)
+	s.server.Addr = ln.Addr().String()
+
+	return s.server.Serve(ln)
 }
 
 // Stop stops the health check server

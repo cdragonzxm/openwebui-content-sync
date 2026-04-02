@@ -11,6 +11,9 @@ import (
 // Config represents the application configuration
 type Config struct {
 	LogLevel     string            `yaml:"log_level"`
+	// SyncMode controls whether the sync runs incrementally (only changed files)
+	// or fully (replacing matching files on every run).
+	SyncMode     string            `yaml:"sync_mode"`
 	Schedule     ScheduleConfig    `yaml:"schedule"`
 	Storage      StorageConfig     `yaml:"storage"`
 	OpenWebUI    OpenWebUIConfig   `yaml:"openwebui"`
@@ -141,6 +144,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		LogLevel: "info",
+		SyncMode: "incremental",
 		Schedule: ScheduleConfig{
 			Interval: 1 * time.Hour,
 		},
@@ -227,6 +231,7 @@ func Load(path string) (*Config, error) {
 	cfg.Confluence.PersonalAccessToken = getEnv("CONFLUENCE_PAT", cfg.Confluence.PersonalAccessToken)
 	cfg.Jira.APIKey = getEnv("CONFLUENCE_API_KEY", cfg.Jira.APIKey)
 	cfg.Storage.Path = getEnv("STORAGE_PATH", cfg.Storage.Path)
+	cfg.SyncMode = getEnv("SYNC_MODE", cfg.SyncMode)
 
 	fmt.Printf("Final OpenWebUI BaseURL: %s\n", cfg.OpenWebUI.BaseURL)
 	fmt.Printf("Environment OPENWEBUI_BASE_URL: %s\n", os.Getenv("OPENWEBUI_BASE_URL"))

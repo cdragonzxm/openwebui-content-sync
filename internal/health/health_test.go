@@ -18,8 +18,8 @@ func TestNewServer(t *testing.T) {
 	if server.server == nil {
 		t.Fatal("Expected HTTP server to be created")
 	}
-	if server.server.Addr != ":8080" {
-		t.Errorf("Expected server address ':8080', got '%s'", server.server.Addr)
+	if server.server.Addr != "127.0.0.1:8080" {
+		t.Errorf("Expected server address '127.0.0.1:8080', got '%s'", server.server.Addr)
 	}
 }
 
@@ -82,7 +82,7 @@ func TestServer_readyHandler(t *testing.T) {
 }
 
 func TestServer_Start(t *testing.T) {
-	server := NewServer(8080) // Use port 0 for random port
+	server := NewServer(0) // Use port 0 for random port
 
 	// Start server in goroutine
 	go func() {
@@ -92,21 +92,32 @@ func TestServer_Start(t *testing.T) {
 		}
 	}()
 
-	// Give server time to start
-	time.Sleep(10 * time.Millisecond)
-
-	// Test health endpoint
-	resp, err := http.Get("http://" + server.server.Addr + "/health")
+	// Wait for server to be ready
+	var resp *http.Response
+	var err error
+	for i := 0; i < 50; i++ {
+		if server.server.Addr != "127.0.0.1:0" {
+			resp, err = http.Get("http://" + server.server.Addr + "/health")
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					resp.Body.Close()
+					break
+				}
+				resp.Body.Close()
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("Failed to make health request: %v", err)
 	}
-	defer resp.Body.Close()
-
+	if resp == nil {
+		t.Fatal("Failed to make health request (no response)")
+	}
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status code %d, got %d", http.StatusOK, resp.StatusCode)
 	}
 
-	// Test ready endpoint
 	resp, err = http.Get("http://" + server.server.Addr + "/ready")
 	if err != nil {
 		t.Fatalf("Failed to make ready request: %v", err)
@@ -184,7 +195,7 @@ func TestServer_DifferentPorts(t *testing.T) {
 			t.Fatalf("Failed to create server on port %d", port)
 		}
 
-		expectedAddr := ":" + fmt.Sprintf("%d", port)
+		expectedAddr := "127.0.0.1:" + fmt.Sprintf("%d", port)
 		if port != 0 && server.server.Addr != expectedAddr {
 			t.Errorf("Expected address %s, got %s", expectedAddr, server.server.Addr)
 		}
@@ -192,7 +203,7 @@ func TestServer_DifferentPorts(t *testing.T) {
 }
 
 func TestServer_ConcurrentRequests(t *testing.T) {
-	server := NewServer(8080)
+	server := NewServer(0)
 
 	// Start server
 	go func() {
@@ -204,8 +215,21 @@ func TestServer_ConcurrentRequests(t *testing.T) {
 		server.Stop(ctx)
 	}()
 
-	// Give server time to start
-	time.Sleep(10 * time.Millisecond)
+	// Wait for server to be ready
+	for i := 0; i < 50; i++ {
+		if server.server.Addr == "127.0.0.1:0" {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		resp, err := http.Get("http://" + server.server.Addr + "/health")
+		if err == nil && resp != nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Make concurrent requests
 	done := make(chan bool, 10)

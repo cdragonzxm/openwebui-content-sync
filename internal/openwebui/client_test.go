@@ -99,6 +99,17 @@ func TestClient_UploadFile(t *testing.T) {
 						t.Errorf("Expected Authorization header, got %s", r.Header.Get("Authorization"))
 					}
 
+					// The client polls `/process/status` and expects a top-level JSON object:
+					// { "status": "...", "error": "..." }.
+					if strings.Contains(r.URL.Path, "/process/status") {
+						w.WriteHeader(http.StatusOK)
+						json.NewEncoder(w).Encode(map[string]string{
+							"status": "processed",
+							"error":  "",
+						})
+						return
+					}
+
 					// Extract file ID from path
 					pathParts := strings.Split(r.URL.Path, "/")
 					fileID := pathParts[len(pathParts)-1]
@@ -185,7 +196,10 @@ func TestClient_ListKnowledge(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(expectedKnowledge)
+		// Client expects: { "data": [...] }
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": expectedKnowledge,
+		})
 	}))
 	defer server.Close()
 

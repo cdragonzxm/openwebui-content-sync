@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/openwebui-content-sync/internal/adapter"
@@ -22,6 +23,7 @@ type Manager struct {
 	knowledgeID     string
 	fileIndex       map[string]*FileMetadata
 	indexPath       string
+	fullSync        bool
 }
 
 // FileMetadata stores metadata about synced files
@@ -39,7 +41,7 @@ type FileMetadata struct {
 }
 
 // NewManager creates a new sync manager
-func NewManager(openwebuiConfig config.OpenWebUIConfig, storageConfig config.StorageConfig) (*Manager, error) {
+func NewManager(openwebuiConfig config.OpenWebUIConfig, storageConfig config.StorageConfig, syncMode string) (*Manager, error) {
 	client := openwebui.NewClient(openwebuiConfig.BaseURL, openwebuiConfig.APIKey)
 
 	// Ensure storage directory exists
@@ -49,11 +51,23 @@ func NewManager(openwebuiConfig config.OpenWebUIConfig, storageConfig config.Sto
 
 	indexPath := filepath.Join(storageConfig.Path, "file_index.json")
 
+	fullSync := false
+	switch strings.ToLower(strings.TrimSpace(syncMode)) {
+	case "full":
+		fullSync = true
+	case "incremental", "":
+		fullSync = false
+	default:
+		// Unknown mode falls back to incremental to keep the app safe.
+		fullSync = false
+	}
+
 	manager := &Manager{
 		openwebuiClient: client,
 		storagePath:     storageConfig.Path,
 		indexPath:       indexPath,
 		fileIndex:       make(map[string]*FileMetadata),
+		fullSync:        fullSync,
 	}
 
 	// Load existing file index
@@ -286,7 +300,7 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 		logrus.Debugf("Found existing file %s by %s (existing: %s, new: %s)", filename, matchReason, existing.Path, file.Path)
 
 		// Prefer content-hash comparison when available to avoid unnecessary uploads.
-		if existing.Hash != "" && file.Hash != "" && existing.Hash == file.Hash {
+		if !m.fullSync && existing.Hash != "" && file.Hash != "" && existing.Hash == file.Hash {
 			logrus.Debugf("File %s unchanged (hash match), skipping upload", file.Path)
 			return nil
 		}
@@ -295,9 +309,13 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 		// re-uploading older or same versions even if hashes differ (e.g. metadata changes).
 		if source == "confluence" && file.ConfluenceVersion > 0 && existing.ConfluenceVersion > 0 {
 			if file.PageID == existing.PageID && file.ConfluenceVersion <= existing.ConfluenceVersion {
+				if m.fullSync {
+					// Full sync mode intentionally re-uploads/refreshes content.
+				} else {
 				logrus.Debugf("Confluence page %s (ID: %s) version %d <= %d, skipping",
 					file.Path, file.PageID, file.ConfluenceVersion, existing.ConfluenceVersion)
 				return nil
+				}
 			}
 			logrus.Infof("Confluence page %s (ID: %s) version changed from %d to %d, updating",
 				file.Path, file.PageID, existing.ConfluenceVersion, file.ConfluenceVersion)
@@ -324,7 +342,7 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 				logrus.Debugf("Existing entry came from OpenWebUI or missing file ID; proceeding to upload to ensure consistency")
 			} else {
 				// For files we previously uploaded (adapter source), allow hash-based skip
-				if existing.Hash == file.Hash {
+				if existing.Hash == file.Hash && !m.fullSync {
 					logrus.Debugf("File %s unchanged (hash match for adapter source), skipping upload", file.Path)
 					return nil
 				}
@@ -379,54 +397,82 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 
 	if knowledgeID != "" {
 		logrus.Debugf("Adding file %s to knowledge %s", uploadedFile.ID, knowledgeID)
+		addedToKnowledge := false
 		if err := m.openwebuiClient.AddFileToKnowledge(ctx, knowledgeID, uploadedFile.ID); err != nil {
-			logrus.Errorf("Failed to add file to knowledge: %v", err)
-
-			// Check if we have fallback content (markdown) to use instead of PDF
-			if len(file.FallbackContent) > 0 && file.FallbackPath != "" {
-				logrus.Infof("Attempting to use markdown fallback for %s", file.Path)
-
-				// Delete the failed PDF file
-				if delErr := m.openwebuiClient.DeleteFile(ctx, uploadedFile.ID); delErr != nil {
-					logrus.Warnf("Failed to delete failed PDF file: %v", delErr)
+			// OpenWebUI may reject re-adding identical content to a knowledge by returning 400 "Duplicate content detected".
+			// In that case, reuse the already-existing file in the knowledge to keep sync idempotent.
+			if m.isDuplicateContentError(err) {
+				if existingFile := m.findFileInKnowledgeByFilename(ctx, knowledgeID, uploadedFile.Filename); existingFile != nil {
+					uploadedFile = existingFile
+					addedToKnowledge = true
 				}
-
-				// Upload markdown fallback
-				fallbackUploaded, uploadErr := m.openwebuiClient.UploadFile(ctx, filepath.Base(file.FallbackPath), file.FallbackContent)
-				if uploadErr != nil {
-					return fmt.Errorf("failed to upload markdown fallback: %w", uploadErr)
-				}
-
-				logrus.Debugf("Uploaded markdown fallback: ID=%s", fallbackUploaded.ID)
-
-				// Add fallback to knowledge
-				if addErr := m.openwebuiClient.AddFileToKnowledge(ctx, knowledgeID, fallbackUploaded.ID); addErr != nil {
-					// Clean up the fallback file if adding fails
-					m.openwebuiClient.DeleteFile(ctx, fallbackUploaded.ID)
-					return fmt.Errorf("failed to add markdown fallback to knowledge: %w", addErr)
-				}
-
-				// Update file info for index
-				uploadedFile = fallbackUploaded
-				file.Path = file.FallbackPath
-				file.Content = file.FallbackContent
-				hash := sha256.Sum256(file.FallbackContent)
-				file.Hash = fmt.Sprintf("%x", hash[:])
-
-				logrus.Infof("Successfully used markdown fallback for %s", file.Path)
-			} else {
-				// Clean up the uploaded file if we can't add it to knowledge
-				m.openwebuiClient.DeleteFile(ctx, uploadedFile.ID)
-				return fmt.Errorf("failed to add file to knowledge: %w", err)
 			}
+
+			if !addedToKnowledge {
+				logrus.Errorf("Failed to add file to knowledge: %v", err)
+
+				// Check if we have fallback content (markdown) to use instead of PDF
+				if len(file.FallbackContent) > 0 && file.FallbackPath != "" {
+					logrus.Infof("Attempting to use markdown fallback for %s", file.Path)
+
+					// Delete the failed PDF file
+					if delErr := m.openwebuiClient.DeleteFile(ctx, uploadedFile.ID); delErr != nil {
+						logrus.Warnf("Failed to delete failed PDF file: %v", delErr)
+					}
+
+					// Upload markdown fallback
+					fallbackUploaded, uploadErr := m.openwebuiClient.UploadFile(ctx, filepath.Base(file.FallbackPath), file.FallbackContent)
+					if uploadErr != nil {
+						return fmt.Errorf("failed to upload markdown fallback: %w", uploadErr)
+					}
+
+					logrus.Debugf("Uploaded markdown fallback: ID=%s", fallbackUploaded.ID)
+
+					// Add fallback to knowledge
+					if addErr := m.openwebuiClient.AddFileToKnowledge(ctx, knowledgeID, fallbackUploaded.ID); addErr != nil {
+						// If it's duplicate content, try to reuse the already-existing file.
+						if m.isDuplicateContentError(addErr) {
+							if existingFallback := m.findFileInKnowledgeByFilename(ctx, knowledgeID, fallbackUploaded.Filename); existingFallback != nil {
+								uploadedFile = existingFallback
+								addedToKnowledge = true
+							}
+						}
+					}
+
+					if !addedToKnowledge {
+						// Clean up the fallback file if adding fails
+						m.openwebuiClient.DeleteFile(ctx, fallbackUploaded.ID)
+						return fmt.Errorf("failed to add markdown fallback to knowledge: %w", err)
+					}
+
+					// Update file info for index
+					file.Path = file.FallbackPath
+					file.Content = file.FallbackContent
+					hash := sha256.Sum256(file.FallbackContent)
+					file.Hash = fmt.Sprintf("%x", hash[:])
+
+					logrus.Infof("Successfully used markdown fallback for %s", file.Path)
+				} else {
+					// Clean up the uploaded file if we can't add it to knowledge
+					m.openwebuiClient.DeleteFile(ctx, uploadedFile.ID)
+					return fmt.Errorf("failed to add file to knowledge: %w", err)
+				}
+			}
+		} else {
+			addedToKnowledge = true
 		}
+
+		if !addedToKnowledge {
+			return fmt.Errorf("file was not added to knowledge: %s", uploadedFile.ID)
+		}
+
 		logrus.Debugf("File successfully added to knowledge")
 	} else {
 		logrus.Warnf("No knowledge ID set, file uploaded but not added to any knowledge base")
 	}
 
-	// Update file index - only if file doesn't exist or was updated
-	if !exists || existing.Hash != file.Hash {
+	// Update file index - in fullSync mode we always refresh metadata after upload.
+	if !exists || existing.Hash != file.Hash || m.fullSync {
 		// Use filename as the key to match OpenWebUI behavior
 		key := filepath.Base(file.Path)
 
@@ -443,6 +489,8 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 			FileID:      uploadedFile.ID,
 			Source:      source,
 			KnowledgeID: knowledgeID,
+			ConfluenceVersion: file.ConfluenceVersion,
+			PageID:            file.PageID,
 			SyncedAt:    time.Now(),
 			Modified:    file.Modified,
 		}
@@ -454,6 +502,35 @@ func (m *Manager) syncFile(ctx context.Context, file *adapter.File, source strin
 	logrus.Debugf("File index now contains %d files", len(m.fileIndex))
 
 	logrus.Infof("Successfully synced file: %s", file.Path)
+	return nil
+}
+
+func (m *Manager) isDuplicateContentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// The OpenWebUI error message is returned as a JSON string in the error body.
+	// We just do substring matching to keep this logic resilient to formatting changes.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate content detected")
+}
+
+func (m *Manager) findFileInKnowledgeByFilename(ctx context.Context, knowledgeID, filename string) *openwebui.File {
+	if knowledgeID == "" || filename == "" {
+		return nil
+	}
+
+	files, err := m.openwebuiClient.GetKnowledgeFiles(ctx, knowledgeID)
+	if err != nil {
+		return nil
+	}
+
+	for _, f := range files {
+		if f != nil && f.Filename == filename {
+			return f
+		}
+	}
+
 	return nil
 }
 
