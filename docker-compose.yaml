@@ -1,0 +1,21 @@
+services:
+  openwebui-content-sync:
+    image: openwebui-content-sync_0402:local
+    container_name: openwebui-content-sync
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.yaml:/root/config.yaml:ro
+      - sync_data:/data
+
+    # All secrets and optional overrides (OPENWEBUI_BASE_URL, etc.) come from .env.
+    # Do not use `environment: VAR=${VAR}` here: empty host-side substitution can
+    # override env_file and clear API keys inside the container.
+    env_file:
+      - ./.env
+volumes:
+  sync_data:
+
+networks:
+  sync-network:

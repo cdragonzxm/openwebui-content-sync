@@ -51,6 +51,21 @@ The connector integrates with OpenWebUI using the following APIs:
 - OpenWebUI instance running
 - GitHub repository access
 
+### Docker Compose (Local)
+
+1. Prepare secrets in `.env` (loaded by `docker-compose.yaml` via `env_file` only — do not duplicate keys with `environment: VAR=${VAR}` or empty host substitution can clear secrets in the container):
+   - `OPENWEBUI_API_KEY` — JWT from OpenWebUI (Settings → Account → API Keys). Regenerate if uploads return `401 Unauthorized` (expired or revoked token).
+   - `CONFLUENCE_API_KEY`
+   - (Optional) `OPENWEBUI_BASE_URL` — overrides `openwebui.base_url` in `config.yaml` if you need a different URL per environment.
+2. Edit `config.yaml` to ensure `openwebui.base_url`, `confluence.base_url`, `confluence.username`, and knowledge mappings are correct.
+3. (Optional) Choose sync mode in `config.yaml`:
+   - `sync_mode: incremental` (default) - only upload changed pages
+   - `sync_mode: full` - replace matching files every run
+4. Start:
+```bash
+docker compose up -d
+```
+
 ### 1. Configure Secrets
 
 Update the secrets in `k8s/secrets.yaml`:
